@@ -83,6 +83,26 @@ def insert_weather(record: dict):
         release_connection(conn)
 
 
+def insert_weather_bulk(records: list[dict]) -> int:
+    """Bulk insert into weather_raw using executemany. Returns inserted row count."""
+    conn = get_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.executemany("""
+                INSERT INTO weather_raw
+                    (recorded_at, temperature, humidity, pressure, wind_speed, weather_main)
+                VALUES
+                    (%(recorded_at)s, %(temperature)s, %(humidity)s,
+                     %(pressure)s, %(wind_speed)s, %(weather_main)s)
+                ON CONFLICT (recorded_at) DO NOTHING
+            """, records)
+            inserted = cur.rowcount
+        conn.commit()
+        return inserted
+    finally:
+        release_connection(conn)
+
+
 def insert_prediction(prediction_for: datetime, predicted_temp: float, model_version: str):
     """Insert a row into weather_predictions."""
     conn = get_connection()
@@ -112,6 +132,18 @@ def insert_metrics(mae: float, rmse: float, model_version: str):
 
 
 # --- Query helpers ---
+
+def get_latest_recorded_at():
+    """Return the most recent recorded_at from weather_raw, or None if empty."""
+    conn = get_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT MAX(recorded_at) FROM weather_raw")
+            result = cur.fetchone()[0]
+        return result
+    finally:
+        release_connection(conn)
+
 
 def fetch_all_weather():
     """Return all rows from weather_raw as a list of dicts."""

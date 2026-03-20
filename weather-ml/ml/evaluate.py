@@ -1,36 +1,34 @@
-import joblib
+"""
+ml/evaluate.py
+Joins weather_predictions with weather_raw on prediction_for = recorded_at,
+computes MAE & RMSE, and stores results in model_metrics.
+"""
+import os
 import numpy as np
-from datetime import datetime
-from sklearn.metrics import mean_absolute_error, mean_squared_error
-from ml.preprocess import load_raw_data, get_features_and_target
-from db.postgres import get_connection
+from db.postgres import fetch_prediction_vs_actual, insert_metrics
 
-MODEL_PATH = "ml/model.pkl"
-MODEL_VERSION = "v1"
+MODEL_VERSION = os.getenv("MODEL_VERSION", "v1")
 
 
 def evaluate():
-    model = joblib.load(MODEL_PATH)
-    df = load_raw_data()
-    X, y = get_features_and_target(df)
+    rows = fetch_prediction_vs_actual()
 
-    predictions = model.predict(X)
-    mae = mean_absolute_error(y, predictions)
-    rmse = np.sqrt(mean_squared_error(y, predictions))
+    if not rows:
+        print("No matched predictions vs actuals yet. Collect more data.")
+        return None
 
-    print(f"MAE: {mae:.4f} | RMSE: {rmse:.4f}")
+    predicted = np.array([r["predicted_temp"] for r in rows])
+    actual = np.array([r["actual_temp"] for r in rows])
 
-    # Store metrics in DB
-    conn = get_connection()
-    with conn.cursor() as cur:
-        cur.execute("""
-            INSERT INTO model_metrics (evaluated_at, mae, rmse, model_version)
-            VALUES (%s, %s, %s, %s)
-        """, (datetime.utcnow(), mae, rmse, MODEL_VERSION))
-    conn.commit()
-    conn.close()
+    errors = predicted - actual
+    mae = float(np.mean(np.abs(errors)))
+    rmse = float(np.sqrt(np.mean(errors ** 2)))
 
-    return {"mae": mae, "rmse": rmse}
+    print(f"Evaluated {len(rows)} predictions | MAE: {mae:.4f} | RMSE: {rmse:.4f}")
+
+    insert_metrics(mae, rmse, MODEL_VERSION)
+
+    return {"mae": mae, "rmse": rmse, "samples": len(rows)}
 
 
 if __name__ == "__main__":

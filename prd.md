@@ -19,16 +19,16 @@ Build a machine learning system that:
 
 * **PostgreSQL**: Hosted on Render (Free Tier)
 * Database connected successfully from local environment
-* Tables planned for:
+* Tables:
 
-  * `weather_raw`
-  * `weather_predictions`
-  * `model_metrics`
+  * `weather_raw` — ground truth actual data (UNIQUE on `recorded_at`)
+  * `weather_predictions` — model guesses
+  * `model_metrics` — error tracking per model version
 
 ### Data Source
 
 * **Primary Source**: OpenWeather API
-* Data fields to collect:
+* Data fields collected:
 
   * datetime
   * temperature
@@ -42,56 +42,167 @@ Build a machine learning system that:
 ## 3. System Architecture Overview
 
 ```
-OpenWeather API  →  Data Collector Script  →  PostgreSQL (Render)
-                                             ↓
-                                       ML Training Pipeline
-                                             ↓
-                                      Trained Model (.pkl)
-                                             ↓
-                                  FastAPI Prediction Service
-                                             ↓
-                               Accuracy Checker vs Real Weather
+OpenWeather API
+      ↓
+data/collect.py  →  weather_raw (actual data)
+                          ↓
+                    ml/train.py  →  model_vN.pkl
+                          ↓
+                    ml/predict.py  →  weather_predictions
+                          ↓
+                    ml/evaluate.py  →  model_metrics
+                          ↓
+              FastAPI + Webhook push (next-hour prediction)
 ```
 
+### Data Flow (Simple View)
+
+```
+OpenWeather API
+      ↓
+weather_raw  (actual data)
+      ↓
+Train Model
+      ↓
+weather_predictions (future predictions)
+      ↓
+Later fetch actual again
+      ↓
+model_metrics (error calculation)
+```
+
+This gives you:
+- training data
+- prediction history
+- accuracy tracking
+
 ---
 
-## 4. Machine Learning Strategy
+## 4. Database Responsibilities
 
-### Initial Model Type
+| Table                | Purpose                        |
+|----------------------|--------------------------------|
+| `weather_raw`        | Ground truth data              |
+| `weather_predictions`| What the model guessed         |
+| `model_metrics`      | How wrong the model was        |
 
-We will start with **supervised learning**, not reinforcement learning, because:
-
-* We have labeled historical data
-* Reinforcement learning is not suitable for time-series prediction directly
-
-### Recommended Algorithms
-
-* Linear Regression (baseline)
-* Random Forest Regressor (primary)
-* Optional upgrade: LSTM for time series
+This separation is important because:
+- training uses only actual data
+- evaluation compares predicted vs actual
 
 ---
 
-## 5. Project Folder Structure
+## 5. Dataset Reference (Open-Meteo Columns)
+
+| Column | Description | Unit | ML Use |
+|---|---|---|---|
+| `time` | Hourly timestamp | datetime | Extract hour, day, month, season |
+| `temperature_2m` | Air temp at 2m height | °C | Primary prediction target |
+| `apparent_temperature` | Feels-like temp | °C | Comfort/heat index feature |
+| `relative_humidity_2m` | Moisture in air | % (0–100) | Rain/fog prediction feature |
+| `dew_point_2m` | Condensation threshold | °C | Fog detection feature |
+| `pressure_msl` | Sea-level air pressure | hPa | Storm detection (low = bad weather) |
+| `cloudcover` | Sky cloud coverage | % (0–100) | Fog/solar prediction feature |
+| `visibility` | Visible distance | meters | Often missing — drop or fill |
+| `windspeed_10m` | Wind speed at 10m | km/h | Storm/wind energy feature |
+| `winddirection_10m` | Wind direction | degrees (0–360) | Storm prediction feature |
+| `windgusts_10m` | Peak gust speed | km/h | Storm prediction feature |
+| `precipitation` | Total precipitation | mm | Flood forecasting target |
+| `rain` | Rain-only component | mm | Rain prediction target |
+| `weathercode` | Encoded weather type | int | Classification target |
+
+### weathercode reference
+
+| Code | Meaning |
+|---|---|
+| 0 | Clear sky |
+| 1–3 | Partly/mostly cloudy |
+| 51–67 | Rain (drizzle to heavy) |
+| 71–77 | Snow |
+| 95+ | Thunderstorm |
+
+---
+
+## 6. Machine Learning Strategy
+
+### Model Type
+
+Supervised learning — we have labeled historical data. Reinforcement learning is not suitable for time-series prediction directly.
+
+### Prediction Targets
+
+| Goal | Target column |
+|---|---|
+| Predict temperature | `temperature_2m` |
+| Predict rain | `precipitation` or `rain` |
+| Classify weather type | `weathercode` |
+
+### Feature Inputs (X)
+
+```
+relative_humidity_2m, dew_point_2m, pressure_msl,
+cloudcover, windspeed_10m, winddirection_10m, windgusts_10m
+```
+
+Plus time-engineered features extracted from `time`:
+
+```python
+df["hour"]        = pd.to_datetime(df["time"]).dt.hour
+df["day_of_week"] = pd.to_datetime(df["time"]).dt.dayofweek
+df["month"]       = pd.to_datetime(df["time"]).dt.month
+```
+
+### Data Cleaning Notes
+
+- `visibility` is often missing — drop or fill with median
+- All numeric columns coerced with `pd.to_numeric(errors="coerce")`, NaN rows dropped
+- No random shuffle — use chronological train/test split:
+
+```python
+train = df[df["time"] < "2024-01-01"]
+test  = df[df["time"] >= "2024-01-01"]
+```
+
+### Algorithms
+
+| Type | Algorithm |
+|---|---|
+| Regression | Linear Regression (baseline), Random Forest, XGBoost |
+| Classification | Random Forest, Logistic Regression, Neural Network |
+| Time-series (advanced) | ARIMA, LSTM, Prophet |
+
+### Learned Patterns (intuition)
+
+- High humidity + low pressure → rain
+- High cloudcover → overcast/rain
+- Pressure drop + strong gusts → storm approaching
+
+---
+
+## 6. Project Folder Structure
 
 ```
 weather-ml/
 │
 ├── app/
-│   ├── main.py                # FastAPI app
-│   ├── predict.py             # Prediction endpoint
+│   ├── main.py                # FastAPI app + hourly webhook scheduler
+│   ├── predict.py             # /predict, /train, /evaluate endpoints
+│   └── webhook.py             # Webhook register/send endpoints
 │
 ├── ml/
 │   ├── train.py               # Model training script
+│   ├── predict.py             # Generate + store next-hour prediction
 │   ├── preprocess.py          # Data cleaning and feature engineering
-│   ├── evaluate.py            # Accuracy comparison with real weather
-│   └── model.pkl              # Saved trained model
+│   ├── evaluate.py            # JOIN predictions vs actuals → model_metrics
+│   ├── model.pkl              # Latest trained model (symlink/copy)
+│   └── model_vN.pkl           # Versioned model snapshots
 │
 ├── data/
-│   └── collect.py             # Script to fetch weather from OpenWeather
+│   ├── collect.py             # Fetch from OpenWeather → weather_raw (hourly)
+│   └── bootstrap.py           # One-time bulk seed from Open-Meteo archive
 │
 ├── db/
-│   └── postgres.py            # DB connection utilities
+│   └── postgres.py            # Connection pool + insert/query helpers
 │
 ├── requirements.txt
 └── README.md
@@ -99,16 +210,16 @@ weather-ml/
 
 ---
 
-## 6. Database Schema (Planned)
+## 7. Database Schema
 
 ### Table: weather_raw
 
-Stores actual weather fetched from API.
+Stores actual weather fetched from API. `recorded_at` is UNIQUE to prevent duplicates.
 
 ```sql
 CREATE TABLE weather_raw (
     id SERIAL PRIMARY KEY,
-    recorded_at TIMESTAMP,
+    recorded_at TIMESTAMP UNIQUE,
     temperature FLOAT,
     humidity FLOAT,
     pressure FLOAT,
@@ -119,21 +230,20 @@ CREATE TABLE weather_raw (
 
 ### Table: weather_predictions
 
-Stores model predictions.
+Stores model predictions. Joined with `weather_raw` on `prediction_for = recorded_at` for evaluation.
 
 ```sql
 CREATE TABLE weather_predictions (
     id SERIAL PRIMARY KEY,
-    prediction_time TIMESTAMP,
+    prediction_for TIMESTAMP,
     predicted_temp FLOAT,
-    predicted_humidity FLOAT,
     model_version TEXT
 );
 ```
 
 ### Table: model_metrics
 
-Tracks accuracy over time.
+Tracks accuracy over time per model version.
 
 ```sql
 CREATE TABLE model_metrics (
@@ -147,14 +257,109 @@ CREATE TABLE model_metrics (
 
 ---
 
-## 7. ML Training Workflow
+## 8. File-by-File Execution Chain
 
-### Step 1 – Fetch Historical Data
+```
+data/collect.py
+      ↓
+ml/train.py
+      ↓
+ml/predict.py
+      ↓
+ml/evaluate.py
+```
 
-* Use OpenWeather historical endpoint
-* Store daily/hourly weather into PostgreSQL
+### Step 1 – data/collect.py
 
-### Step 2 – Feature Engineering
+Runs hourly or manually.
+
+```
+API → JSON → INSERT INTO weather_raw
+```
+
+Key rule: `recorded_at` must be UNIQUE — prevents duplicate rows when the script runs twice (`ON CONFLICT DO NOTHING`).
+
+### Step 0 (Bootstrap) – data/bootstrap.py
+
+Handles two scenarios automatically:
+
+| Scenario | Behaviour |
+|---|---|
+| DB is empty | Full seed from `2020-01-01` to yesterday |
+| DB is behind | Gap fill from `last_recorded_at + 1 day` to yesterday |
+| DB is current | No-op |
+
+Called automatically by `ml/train.py` before every training run, or manually:
+
+```bash
+python data/bootstrap.py
+```
+
+Dynamic URL logic:
+- `HISTORY_START = 2020-01-01` — fixed, never changes
+- `end_date` = yesterday (always `date.today() - 1`)
+- `start_date` = `HISTORY_START` if DB empty, else `last_recorded_at.date() + 1 day`
+- Lat/lon fixed to Gurgaon (28.4595, 77.0266)
+
+Cleaning steps:
+- Rename Open-Meteo fields to match `weather_raw` schema
+- Parse `time` → `recorded_at` as datetime
+- Coerce all numeric columns with `pd.to_numeric(errors="coerce")`
+- Drop rows with any NaN
+
+### Step 2 – ml/train.py
+
+```
+SELECT * FROM weather_raw
+      ↓
+feature engineering
+      ↓
+train regression model
+      ↓
+save model_vN.pkl + model.pkl
+```
+
+Example training dataset:
+
+| time  | temp | humidity | pressure |
+|-------|------|----------|----------|
+| 10:00 | 30   | 55       | 1012     |
+| 11:00 | 32   | 52       | 1011     |
+
+### Step 3 – ml/predict.py
+
+Loads `model.pkl`, fetches latest weather, predicts next-hour temperature, stores it:
+
+```
+INSERT INTO weather_predictions
+```
+
+Example row:
+
+| prediction_for      | predicted_temp | model_version |
+|---------------------|----------------|---------------|
+| 2026-03-20 15:00    | 34.2           | v1            |
+
+### Step 4 – ml/evaluate.py
+
+Runs after actual data becomes available. JOINs predictions with actuals:
+
+```sql
+SELECT
+    p.prediction_for,
+    p.predicted_temp,
+    r.temperature
+FROM weather_predictions p
+JOIN weather_raw r ON p.prediction_for = r.recorded_at;
+```
+
+Python computes `error = predicted - actual` and stores MAE & RMSE in `model_metrics`.
+
+---
+
+## 9. ML Training Workflow
+
+### Feature Engineering
 
 Convert datetime into model-friendly features:
 
@@ -162,30 +367,42 @@ Convert datetime into model-friendly features:
 * day_of_week
 * month
 
-### Step 3 – Train Model
-
-Example features:
+### Model Features
 
 ```
-X = [hour, humidity, pressure, wind_speed]
-y = temperature
+X = [hour, day_of_week, month, relative_humidity_2m, dew_point_2m,
+     pressure_msl, cloudcover, windspeed_10m, winddirection_10m, windgusts_10m]
+y = temperature_2m  (or weathercode for classification)
 ```
 
-### Step 4 – Save Model
+### Save Model
 
-```
-joblib.dump(model, "ml/model.pkl")
+```python
+joblib.dump(model, "ml/model_v1.pkl")
+joblib.dump(model, "ml/model.pkl")  # latest
 ```
 
 ---
 
-## 8. Weekly Retraining Strategy
+## 10. Weekly Retraining Strategy
 
 This simulates reinforcement learning by:
 
 * Collecting new data every day
 * Retraining every week
 * Comparing performance with previous model
+
+### Cron Schedule
+
+```
+Daily:
+    collect.py
+
+Every Sunday:
+    train.py
+    predict.py
+    evaluate.py
+```
 
 Workflow:
 
@@ -203,19 +420,19 @@ Replace model if improved
 
 ---
 
-## 9. Model Evaluation Metrics
+## 11. Model Evaluation Metrics
 
-We will track:
+We track:
 
 * **MAE** – Mean Absolute Error
 * **RMSE** – Root Mean Squared Error
-* Accuracy trend over time
+* Accuracy trend over time per model version
 
-This allows monitoring whether weekly retraining is actually improving predictions.
+This allows answering: *Which model version was most accurate?*
 
 ---
 
-## 10. FastAPI Endpoints (Planned)
+## 12. FastAPI Endpoints
 
 ### Predict Weather
 
@@ -225,10 +442,12 @@ GET /predict?hours_ahead=3
 
 Returns:
 
-```
+```json
 {
+  "prediction_for": "2026-03-20T15:00:00",
   "predicted_temperature": 31.2,
-  "confidence": 0.82
+  "model_version": "v1",
+  "hours_ahead": 3
 }
 ```
 
@@ -238,18 +457,80 @@ Returns:
 POST /train
 ```
 
-Used manually or via cron to retrain model.
+### Trigger Evaluation
+
+```
+POST /evaluate
+```
+
+### Webhook – Register URL
+
+```
+POST /webhook/register
+Body: { "url": "https://your-service.com/hook" }
+```
+
+### Webhook – Send Now
+
+```
+POST /webhook/send?hours_ahead=1
+```
+
+Pushes next-hour prediction to all registered URLs immediately.
+
+### Webhook – List
+
+```
+GET /webhook/list
+```
+
+### Webhook – Unregister
+
+```
+DELETE /webhook/unregister
+Body: { "url": "https://your-service.com/hook" }
+```
+
+### Webhook Payload (sent automatically every hour)
+
+```json
+{
+  "predicted_temperature": 28.4,
+  "hours_ahead": 1,
+  "prediction_for": "2026-03-20T15:00:00Z",
+  "sent_at": "2026-03-20T14:00:00Z"
+}
+```
 
 ---
 
-## 11. Deployment Plan on Render
+## 13. db/postgres.py Responsibilities
+
+Contains connection pooling, insert helpers, and query helpers so all other scripts call simple functions:
+
+```python
+from db.postgres import insert_weather, insert_prediction, insert_metrics
+from db.postgres import fetch_all_weather, fetch_prediction_vs_actual
+```
+
+No raw SQL scattered across scripts.
+
+---
+
+## 14. Deployment Plan on Render
 
 ### Services
 
-We will deploy **two services** on Render free tier:
-
 1. **PostgreSQL** (already running)
 2. **FastAPI Web Service**
+
+### Environment Variables
+
+* `DATABASE_URL` — Render PostgreSQL connection string
+* `OPENWEATHER_API_KEY` — OpenWeather API key
+* `WEATHER_CITY` — City to collect weather for (default: London)
+* `MODEL_VERSION` — Current model version tag (default: v1)
+* `WEBHOOK_URL` — Optional default webhook URL pre-registered on startup
 
 ### Render Constraints
 
@@ -259,91 +540,103 @@ We will deploy **two services** on Render free tier:
 
 ---
 
-## 12. Accuracy Verification with Real Weather
-
-After prediction:
+## 15. Accuracy Verification with Real Weather
 
 ```
-Model Prediction → Store in weather_predictions
-                     ↓
-Later fetch actual weather
-                     ↓
-Compare and store error in model_metrics
+ml/predict.py → INSERT INTO weather_predictions
+                          ↓
+              (wait for actual data to arrive)
+                          ↓
+ml/evaluate.py → JOIN predictions with weather_raw
+                          ↓
+              INSERT INTO model_metrics
 ```
 
 This creates a continuous feedback loop.
 
 ---
 
-## 13. Development Roadmap
-
-### Phase 1 – Data Pipeline
-
-* [ ] Create OpenWeather fetch script
-* [ ] Store hourly data in PostgreSQL
-
-### Phase 2 – ML Model
-
-* [ ] Create preprocessing pipeline
-* [ ] Train baseline regression model
-* [ ] Save model.pkl
-
-### Phase 3 – Evaluation System
-
-* [ ] Build comparison script
-* [ ] Store MAE & RMSE
-
-### Phase 4 – API Deployment
-
-* [ ] Build FastAPI predict endpoint
-* [ ] Deploy to Render
-
-### Phase 5 – Automation
-
-* [ ] Weekly retraining cron job
-* [ ] Daily data ingestion job
-
----
-
-## 14. Next Immediate Tasks
-
-The next files to implement in order:
-
-1. `data/collect.py`
-2. `db/postgres.py`
-3. `ml/preprocess.py`
-4. `ml/train.py`
-
-We will start with **data collection**, because model training depends on stored historical data.
-
----
-
-## 15. Risks & Considerations
-
-* OpenWeather free tier has rate limits
-* Render free tier has storage and compute limits
-* Model drift may occur due to seasonal weather patterns
-
----
-
 ## 16. Versioning Strategy
 
-Each model will be stored with version tag:
+Each model saved with version tag:
 
 ```
 model_v1.pkl
 model_v2.pkl
 ```
 
-Database column `model_version` will track which model made each prediction.
+`model.pkl` always points to the latest. `model_version` column in DB tracks which model made each prediction, enabling comparison across versions.
 
 ---
 
-## 17. Definition of Project Completion
+## 17. Data Lifecycle Example
+
+| Day | weather_raw | weather_predictions | model_metrics |
+|-----|-------------|---------------------|---------------|
+| 1   | 24 rows     | 0                   | 0             |
+| 3   | 72 rows     | 48 rows             | 24 rows       |
+| 30  | 720+ rows   | meaningful ML       | trend visible |
+
+At 720+ training samples, ML predictions become statistically meaningful.
+
+---
+
+## 18. Development Roadmap
+
+### Phase 1 – Data Pipeline
+* [x] `db/postgres.py` — connection pool + helpers (including `insert_weather_bulk`)
+* [x] `data/bootstrap.py` — dynamic date-range sync (full seed or gap fill); auto-called by `train.py`
+* [x] `data/collect.py` — fetch + store with dedup
+
+### Phase 2 – ML Model
+* [x] `ml/preprocess.py` — feature engineering
+* [x] `ml/train.py` — train + save versioned model
+* [x] `ml/predict.py` — predict next hour + store
+
+### Phase 3 – Evaluation System
+* [x] `ml/evaluate.py` — JOIN + compute MAE/RMSE + store
+
+### Phase 4 – API Deployment
+* [x] FastAPI `/predict`, `/train`, `/evaluate` endpoints
+* [x] Webhook system with register/send/list/unregister
+* [x] Hourly background scheduler for automatic webhook push
+* [ ] Deploy to Render
+
+### Phase 5 – Automation
+* [ ] Daily cron: `collect.py`
+* [ ] Weekly cron (Sunday): `train.py` → `predict.py` → `evaluate.py`
+
+---
+
+## 19. Strict Implementation Order
+
+```
+db/postgres.py
+data/collect.py
+ml/train.py
+ml/predict.py
+ml/evaluate.py
+```
+
+Skipping this order makes debugging very hard because each step depends on the previous one's output.
+
+---
+
+## 20. Risks & Considerations
+
+* OpenWeather free tier has rate limits
+* Render free tier has storage and compute limits
+* Model drift may occur due to seasonal weather patterns
+* `prediction_for` must align exactly with `recorded_at` for JOIN to work (truncate to hour)
+
+---
+
+## 21. Definition of Project Completion
 
 The system is considered complete when:
 
 * Predictions are generated automatically
-* Accuracy metrics are tracked
+* Accuracy metrics are tracked per model version
 * Weekly retraining runs without manual intervention
 * API is publicly accessible
+* Webhook delivers next-hour predictions to registered consumers

@@ -3,6 +3,7 @@ import joblib
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.model_selection import train_test_split
 from ml.preprocess import load_raw_data, get_features_and_target
+from data.bootstrap import sync
 
 MODELS_DIR = "ml"
 MODEL_VERSION = os.getenv("MODEL_VERSION", "v1")
@@ -13,6 +14,7 @@ def get_model_path(version: str) -> str:
 
 
 def train():
+    sync()   # ensure DB is up to date before training
     df = load_raw_data()
     if len(df) < 10:
         print("Not enough data to train. Need at least 10 records.")
