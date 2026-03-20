@@ -1,6 +1,7 @@
 import os
 import psycopg2
 from psycopg2 import pool
+from psycopg2.extras import execute_values
 from datetime import datetime
 from dotenv import load_dotenv
 
@@ -87,21 +88,21 @@ def insert_weather(record: dict):
 
 
 def insert_weather_bulk(records: list[dict]) -> int:
-    """Bulk insert into weather_raw using executemany. Returns inserted row count."""
+    """Bulk insert into weather_raw using execute_values (single query). Returns row count."""
     conn = get_connection()
     try:
         with conn.cursor() as cur:
-            cur.executemany("""
+            execute_values(cur, """
                 INSERT INTO weather_raw
                     (recorded_at, temperature, humidity, pressure, wind_speed, weather_main)
-                VALUES
-                    (%(recorded_at)s, %(temperature)s, %(humidity)s,
-                     %(pressure)s, %(wind_speed)s, %(weather_main)s)
+                VALUES %s
                 ON CONFLICT (recorded_at) DO NOTHING
-            """, records)
-            inserted = cur.rowcount
+            """, [(
+                r["recorded_at"], r["temperature"], r["humidity"],
+                r["pressure"], r["wind_speed"], r["weather_main"]
+            ) for r in records], page_size=1000)
         conn.commit()
-        return inserted
+        return len(records)
     finally:
         release_connection(conn)
 

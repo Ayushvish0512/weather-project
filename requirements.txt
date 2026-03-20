@@ -10,3 +10,4 @@ numpy
 xgboost
 statsmodels
 python-dotenv
+python-dateutil
