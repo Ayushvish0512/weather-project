@@ -179,6 +179,138 @@ test  = df[df["time"] >= "2024-01-01"]
 
 ---
 
+### ML Pipeline Implementation Guide
+
+Three separate pipelines are built and compared:
+
+1. Regression — predict temperature or precipitation (numeric output)
+2. Classification — predict weathercode (category output)
+3. Time-series — forecast future values sequentially
+
+#### Common Setup
+
+```python
+df["time"] = pd.to_datetime(df["time"])
+df["hour"]  = df["time"].dt.hour
+df["day"]   = df["time"].dt.day
+df["month"] = df["time"].dt.month
+df = df.drop(columns=["visibility"]).dropna()
+```
+
+Chronological split (never shuffle time-series data):
+
+```python
+split = int(len(df) * 0.8)
+X_train, X_test = X[:split], X[split:]
+y_train, y_test = y[:split], y[split:]
+```
+
+#### Regression (predict temperature)
+
+```python
+# Features & target
+X = df.drop(columns=["temperature_2m", "time"])
+y = df["temperature_2m"]
+
+# Train all three
+from sklearn.linear_model import LinearRegression
+from sklearn.ensemble import RandomForestRegressor
+from xgboost import XGBRegressor
+
+models = [LinearRegression(), RandomForestRegressor(), XGBRegressor()]
+for m in models:
+    m.fit(X_train, y_train)
+
+# Evaluate
+from sklearn.metrics import mean_absolute_error
+for m in models:
+    print(m.__class__.__name__, mean_absolute_error(y_test, m.predict(X_test)))
+```
+
+#### Classification (predict weathercode)
+
+```python
+X = df.drop(columns=["weathercode", "time"])
+y = df["weathercode"]
+
+from sklearn.linear_model import LogisticRegression
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.neural_network import MLPClassifier
+
+models = [
+    LogisticRegression(max_iter=1000),
+    RandomForestClassifier(),
+    MLPClassifier(hidden_layer_sizes=(64, 32), max_iter=500)
+]
+for m in models:
+    m.fit(X_train, y_train)
+
+from sklearn.metrics import accuracy_score
+for m in models:
+    print(m.__class__.__name__, accuracy_score(y_test, m.predict(X_test)))
+```
+
+Note: normalize features before MLPClassifier using `StandardScaler`.
+
+#### Time-Series (advanced)
+
+ARIMA — classical, good for temperature/pressure:
+
+```python
+from statsmodels.tsa.arima.model import ARIMA
+model_fit = ARIMA(df["temperature_2m"], order=(5,1,0)).fit()
+forecast = model_fit.forecast(steps=10)
+```
+
+Prophet — easy, handles seasonality well:
+
+```python
+from prophet import Prophet
+prophet_df = df[["time", "temperature_2m"]].rename(columns={"time":"ds","temperature_2m":"y"})
+m = Prophet()
+m.fit(prophet_df)
+forecast = m.predict(m.make_future_dataframe(periods=24))
+```
+
+LSTM — deep learning, best for complex patterns (requires sequence reshaping):
+
+```python
+X_lstm = np.array(X).reshape((X.shape[0], 1, X.shape[1]))
+model = Sequential([LSTM(50, activation='relu', input_shape=(1, X.shape[1])), Dense(1)])
+model.compile(optimizer='adam', loss='mse')
+model.fit(X_lstm, y, epochs=10)
+```
+
+#### Model Comparison Metrics
+
+| Pipeline | Metric |
+|---|---|
+| Regression | MAE, RMSE |
+| Classification | Accuracy, Confusion Matrix |
+| Time-series | MAE, RMSE on forecast |
+
+#### Recommended Progression
+
+Start simple → validate → improve:
+
+```
+LinearRegression / LogisticRegression
+        ↓
+  RandomForest
+        ↓
+   XGBoost
+        ↓
+ LSTM / Prophet
+```
+
+#### Pro Tips
+
+- Add lag features to capture temporal patterns: `df["temp_lag1"] = df["temperature_2m"].shift(1)`
+- Handle class imbalance in `weathercode` (rare storm codes vs common clear-sky codes)
+- Normalize inputs for neural networks with `StandardScaler`
+
+---
+
 ## 6. Project Folder Structure
 
 ```
