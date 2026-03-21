@@ -1,16 +1,24 @@
 import os
+import sys
 import glob
 import joblib
 import numpy as np
 import pandas as pd
+from pathlib import Path
 from fastapi import APIRouter, HTTPException
 from datetime import datetime, timedelta
+
+ROOT = Path(__file__).resolve().parent.parent
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
 from db.postgres import insert_prediction
 
 router = APIRouter(tags=["predictions"])
 
-MODEL_PATH    = "ml/model.pkl"
+MODEL_PATH    = str(ROOT / "ml" / "model.pkl")
 MODEL_VERSION = os.getenv("MODEL_VERSION", "v1")
+DATA_GLOB     = str(ROOT / "data" / "weather_*.csv")
 FEATURE_COLS  = ["hour", "day_of_week", "month", "humidity", "dew_point",
                  "pressure", "cloudcover", "wind_speed", "wind_direction", "wind_gusts"]
 
@@ -23,7 +31,7 @@ def load_model():
 
 
 def get_latest_features() -> dict:
-    files = sorted(glob.glob("data/weather_*.csv"))
+    files = sorted(glob.glob(DATA_GLOB))
     if not files:
         raise HTTPException(status_code=503, detail="No CSV data. Run data/bootstrap.py first.")
     row = pd.read_csv(files[-1]).iloc[-1]

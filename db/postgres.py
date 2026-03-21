@@ -3,9 +3,11 @@ import psycopg2
 from psycopg2 import pool
 from psycopg2.extras import execute_values
 from datetime import datetime
+from pathlib import Path
 from dotenv import load_dotenv
 
-load_dotenv()
+# Always load .env from the project root regardless of where the script is run from
+load_dotenv(dotenv_path=Path(__file__).resolve().parent.parent / ".env")
 
 DATABASE_URL = os.getenv("DATABASE_URL")
 
@@ -16,9 +18,12 @@ _pool = None
 def get_pool():
     global _pool
     if _pool is None:
-        if not DATABASE_URL:
-            raise EnvironmentError("DATABASE_URL environment variable is not set")
-        _pool = pool.SimpleConnectionPool(1, 5, DATABASE_URL)
+        db_url = os.getenv("DATABASE_URL")
+        if not db_url:
+            raise EnvironmentError(
+                "DATABASE_URL is not set. Check your .env file exists at the project root."
+            )
+        _pool = pool.SimpleConnectionPool(1, 5, db_url)
     return _pool
 
 

@@ -4,23 +4,32 @@ Loads model.pkl, predicts next-hour temperature, stores result in DB.
 Features come from the latest row in the merged CSV data.
 """
 import os
+import sys
 import glob
 import joblib
 import numpy as np
 import pandas as pd
+from pathlib import Path
 from datetime import datetime, timedelta
+
+# Ensure project root is on sys.path so `db` resolves anywhere
+ROOT = Path(__file__).resolve().parent.parent
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
 from db.postgres import insert_prediction
 
-MODEL_PATH    = "ml/model.pkl"
+MODEL_PATH    = str(ROOT / "ml" / "model.pkl")
 MODEL_VERSION = os.getenv("MODEL_VERSION", "v1")
+DATA_GLOB     = str(ROOT / "data" / "weather_*.csv")
 FEATURE_COLS  = ["hour", "day_of_week", "month", "humidity", "dew_point",
                  "pressure", "cloudcover", "wind_speed", "wind_direction", "wind_gusts"]
 
 
 def get_latest_features() -> dict:
-    files = sorted(glob.glob("data/weather_*.csv"))
+    files = sorted(glob.glob(DATA_GLOB))
     if not files:
-        raise FileNotFoundError("No CSV files found. Run data/bootstrap.py first.")
+        raise FileNotFoundError(f"No CSV files found at {DATA_GLOB}. Run data/bootstrap.py first.")
     # Read only last file for speed, take last row
     df = pd.read_csv(files[-1])
     row = df.iloc[-1]
