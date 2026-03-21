@@ -30,12 +30,18 @@ def _build_prediction(hours_ahead: int = 1) -> dict:
     except FileNotFoundError:
         return None
 
-    future_time = datetime.utcnow() + timedelta(hours=hours_ahead)
+    import glob, pandas as pd
+    files = sorted(glob.glob("data/weather_*.csv"))
+    if not files:
+        return None
+    row = pd.read_csv(files[-1]).iloc[-1]
+
+    future_time = datetime.utcnow().replace(minute=0, second=0, microsecond=0) + timedelta(hours=hours_ahead)
     features = np.array([[
-        future_time.hour,
-        60.0,    # placeholder humidity
-        1013.0,  # placeholder pressure
-        5.0      # placeholder wind_speed
+        future_time.hour, future_time.weekday(), future_time.month,
+        float(row["humidity"]), float(row["dew_point"]), float(row["pressure"]),
+        float(row["cloudcover"]), float(row["wind_speed"]),
+        float(row["wind_direction"]), float(row["wind_gusts"]),
     ]])
     temp = model.predict(features)[0]
     return {
