@@ -1,5 +1,174 @@
 # Weather Prediction ML Project – Architecture & Progress Log
 
+---
+
+## Developer Quick Start Guide
+
+### Prerequisites
+
+- Python 3.10+ installed
+- PostgreSQL connection string (Render or local)
+- OpenWeather API key (optional, for live collection)
+
+### 1. Setup environment
+
+```powershell
+py -m venv venv
+.\venv\Scripts\pip install -r requirements.txt
+```
+
+### 2. Configure environment variables
+
+Copy `.env.example` to `.env` and fill in your values:
+
+```
+DATABASE_URL=postgresql://user:password@host/dbname
+OPENWEATHER_API_KEY=your_key_here
+WEATHER_CITY=Gurgaon
+MODEL_VERSION=v1
+WEBHOOK_URL=https://your-webhook-url.com/hook
+```
+
+### 3. Initialize the database
+
+Creates `weather_raw`, `weather_predictions`, `model_metrics` tables:
+
+```powershell
+.\venv\Scripts\python.exe db/postgres.py
+```
+
+### 4. Download historical weather data
+
+Downloads year-by-year CSVs from Open-Meteo archive into `data/`. Already downloaded files are skipped automatically.
+
+```powershell
+.\venv\Scripts\python.exe data/bootstrap.py
+```
+
+To change the date range, edit in `data/bootstrap.py`:
+
+```python
+HISTORY_START = date(2020, 1, 1)   # never change this
+HISTORY_END   = date(2026, 3, 13)  # extend to get more recent data
+```
+
+### 5. Train a single model
+
+Trains RandomForest on all CSVs in `data/`, saves `ml/model.pkl` and `ml/model_v1.pkl`:
+
+```powershell
+.\venv\Scripts\python.exe ml/train.py
+```
+
+### 6. Train all models and compare
+
+Trains 7 algorithms, prints MAE comparison, saves each as a separate `.pkl`, sets the best as `model.pkl`:
+
+```powershell
+.\venv\Scripts\python.exe ml/train_all.py
+```
+
+Output example:
+
+```
+Model                          MAE
+-----------------------------------
+linear_regression           1.3079°C
+ridge                       1.3079°C
+decision_tree               0.5719°C
+random_forest               0.1864°C   ← best
+gradient_boosting           0.6027°C
+xgboost                     0.2888°C
+knn                         1.5430°C
+
+Best: random_forest → saved as model.pkl
+```
+
+Saved model files in `ml/`:
+
+```
+model.pkl                    ← always the best model
+model_random_forest.pkl
+model_xgboost.pkl
+model_gradient_boosting.pkl
+model_decision_tree.pkl
+model_linear_regression.pkl
+model_ridge.pkl
+model_knn.pkl
+model_v1.pkl                 ← versioned snapshot
+```
+
+To use a specific model, change `MODEL_PATH` in `ml/predict.py`:
+
+```python
+MODEL_PATH = "ml/model_xgboost.pkl"
+```
+
+### 7. Generate a prediction
+
+```powershell
+.\venv\Scripts\python.exe ml/predict.py
+```
+
+### 8. Run the FastAPI server
+
+```powershell
+.\venv\Scripts\uvicorn.exe app.main:app --reload
+```
+
+Open `http://127.0.0.1:8000/docs` for Swagger UI.
+
+| Endpoint | Description |
+|---|---|
+| `GET /predict/next-hour` | Next hour temp + weather summary |
+| `GET /predict/hours?hours=6` | Forecast for next N hours (max 24) |
+| `GET /predict/today` | All remaining hours of today |
+| `POST /train` | Retrain model via API |
+| `POST /evaluate` | Evaluate predictions vs actuals |
+| `POST /webhook/send` | Manually push prediction to webhook |
+
+### 9. About model training — no epochs
+
+This project uses tree-based models (RandomForest, XGBoost), not neural networks. There are no epochs.
+
+| Concept | Neural Network | Random Forest / XGBoost |
+|---|---|---|
+| Training unit | epoch (full data pass) | n_estimators (number of trees) |
+| Our setting | N/A | `n_estimators=100` |
+| Overfitting control | early stopping | `max_depth`, `min_samples_leaf` |
+| Training time | minutes–hours | seconds–minutes |
+
+`n_estimators=100` is the equivalent of 100 training iterations — 100 trees are built and their results averaged.
+
+To train stronger models, just increase the tree count:
+
+```python
+RandomForestRegressor(n_estimators=200)  # stronger, slower
+XGBRegressor(n_estimators=300)
+```
+
+If you ever need actual epochs (e.g. switching to LSTM), you'd use a neural network:
+
+```python
+model.fit(X_train, y_train, epochs=100)  # only for neural networks
+```
+
+Bottom line:
+- no epochs in the current setup
+- `n_estimators=100` is the equivalent knob to tune
+- increase it to improve accuracy at the cost of training time
+
+### 10. Weekly retraining (production)
+
+```powershell
+.\venv\Scripts\python.exe data/bootstrap.py   # fill data gaps
+.\venv\Scripts\python.exe ml/train_all.py     # retrain + compare all models
+.\venv\Scripts\python.exe ml/predict.py       # store new prediction
+.\venv\Scripts\python.exe ml/evaluate.py      # log accuracy metrics
+```
+
+---
+
 ## 1. Project Goal
 
 Build a machine learning system that:
