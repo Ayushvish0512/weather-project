@@ -13,14 +13,13 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from db.postgres import insert_prediction
+from ml.preprocess import engineer_features, FEATURE_COLS
 
 router = APIRouter(tags=["predictions"])
 
 MODEL_PATH    = str(ROOT / "ml" / "model.pkl")
 MODEL_VERSION = os.getenv("MODEL_VERSION", "v1")
 DATA_GLOB     = str(ROOT / "data" / "weather_*.csv")
-FEATURE_COLS  = ["hour", "day_of_week", "month", "humidity", "dew_point",
-                 "pressure", "cloudcover", "wind_speed", "wind_direction", "wind_gusts"]
 
 
 def load_model():
@@ -30,26 +29,24 @@ def load_model():
         return None
 
 
-def get_latest_features() -> dict:
+def get_latest_features() -> tuple[np.ndarray, dict]:
+    """Load last 30 rows, engineer all 24 features, return (feature_array, last_raw_row)."""
     files = sorted(glob.glob(DATA_GLOB))
     if not files:
         raise HTTPException(status_code=503, detail="No CSV data. Run data/bootstrap.py first.")
-    row = pd.read_csv(files[-1]).iloc[-1]
-    return {
-        "humidity":       float(row["humidity"]),
-        "dew_point":      float(row["dew_point"]),
-        "pressure":       float(row["pressure"]),
-        "cloudcover":     float(row["cloudcover"]),
-        "wind_speed":     float(row["wind_speed"]),
-        "wind_direction": float(row["wind_direction"]),
-        "wind_gusts":     float(row["wind_gusts"]),
+    df = pd.read_csv(files[-1]).tail(30).copy()
+    df["recorded_at"] = pd.to_datetime(df["recorded_at"])
+    df = df.sort_values("recorded_at").reset_index(drop=True)
+    df = engineer_features(df)
+    df.dropna(subset=FEATURE_COLS, inplace=True)
+    if df.empty:
+        raise HTTPException(status_code=503, detail="Not enough rows to compute lag features.")
+    last = df.iloc[-1]
+    raw = {
+        "cloudcover": float(last.get("cloudcover", 0)),
+        "wind_speed":  float(last.get("wind_speed", 0)),
     }
-
-
-def build_features(dt: datetime, c: dict) -> np.ndarray:
-    return np.array([[dt.hour, dt.weekday(), dt.month,
-                      c["humidity"], c["dew_point"], c["pressure"],
-                      c["cloudcover"], c["wind_speed"], c["wind_direction"], c["wind_gusts"]]])
+    return last[FEATURE_COLS].values.astype("float32").reshape(1, -1), raw
 
 
 def weather_summary(temp: float, cloudcover: float, wind_speed: float) -> str:
@@ -69,16 +66,15 @@ def predict_next_hour():
     if model is None:
         raise HTTPException(status_code=503, detail="Model not trained. Run ml/train.py first.")
 
-    c  = get_latest_features()
-    dt = datetime.utcnow().replace(minute=0, second=0, microsecond=0) + timedelta(hours=1)
-    temp = round(float(model.predict(build_features(dt, c))[0]), 2)
+    features, raw = get_latest_features()
+    dt   = datetime.utcnow().replace(minute=0, second=0, microsecond=0) + timedelta(hours=1)
+    temp = round(float(model.predict(features)[0]), 2)
     insert_prediction(dt, temp, MODEL_VERSION)
 
     return {
         "prediction_for":   dt.isoformat() + "Z",
         "predicted_temp_c": temp,
-        "summary":          weather_summary(temp, c["cloudcover"], c["wind_speed"]),
-        "conditions_used":  c,
+        "summary":          weather_summary(temp, raw["cloudcover"], raw["wind_speed"]),
         "model_version":    MODEL_VERSION,
     }
 
@@ -93,19 +89,19 @@ def predict_multiple_hours(hours: int = 6):
     if model is None:
         raise HTTPException(status_code=503, detail="Model not trained. Run ml/train.py first.")
 
-    c   = get_latest_features()
+    features, raw = get_latest_features()
     now = datetime.utcnow().replace(minute=0, second=0, microsecond=0)
 
     forecast = []
     for h in range(1, hours + 1):
         dt   = now + timedelta(hours=h)
-        temp = round(float(model.predict(build_features(dt, c))[0]), 2)
+        temp = round(float(model.predict(features)[0]), 2)
         insert_prediction(dt, temp, MODEL_VERSION)
         forecast.append({
             "hour":             h,
             "prediction_for":   dt.isoformat() + "Z",
             "predicted_temp_c": temp,
-            "summary":          weather_summary(temp, c["cloudcover"], c["wind_speed"]),
+            "summary":          weather_summary(temp, raw["cloudcover"], raw["wind_speed"]),
         })
 
     return {

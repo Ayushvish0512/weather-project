@@ -22,28 +22,19 @@ from sklearn.neighbors import KNeighborsRegressor
 from sklearn.metrics import mean_absolute_error
 from xgboost import XGBRegressor, callback
 
-ROOT         = Path(__file__).resolve().parent.parent
-MODELS_DIR   = ROOT / "ml"
-DATA_GLOB    = str(ROOT / "data" / "weather_*.csv")
-FEATURE_COLS = ["hour", "day_of_week", "month", "humidity", "dew_point",
-                "pressure", "cloudcover", "wind_speed", "wind_direction", "wind_gusts"]
+from ml.preprocess import load_raw_data, engineer_features, get_features_and_target, FEATURE_COLS
 
-EPOCHS       = 300  # simulated epoch rounds for tree models
-TREES_TOTAL  = 1500  # total n_estimators split across epochs
+ROOT       = Path(__file__).resolve().parent.parent
+MODELS_DIR = ROOT / "ml"
+
+EPOCHS      = 10
+TREES_TOTAL = 50
 
 
 def load_data():
-    files = sorted(glob.glob(DATA_GLOB))
-    if not files:
-        raise FileNotFoundError("No CSV files in data/. Run data/bootstrap.py first.")
-    df = pd.concat([pd.read_csv(f) for f in files], ignore_index=True)
-    df["recorded_at"] = pd.to_datetime(df["recorded_at"])
-    df = df.sort_values("recorded_at").drop_duplicates("recorded_at").reset_index(drop=True)
-    df["hour"]        = df["recorded_at"].dt.hour
-    df["day_of_week"] = df["recorded_at"].dt.dayofweek
-    df["month"]       = df["recorded_at"].dt.month
-    df.dropna(subset=FEATURE_COLS + ["temperature"], inplace=True)
-    return df
+    df = load_raw_data()
+    X, y = get_features_and_target(df)
+    return X, y
 
 
 def free(model):
@@ -56,10 +47,10 @@ def train_rf(X_train, y_train, X_test, y_test, name="random_forest"):
     trees_per_epoch = TREES_TOTAL // EPOCHS
     model = RandomForestRegressor(
         n_estimators=0, warm_start=True, random_state=42,
-        n_jobs=1,           # 1 core = no parallel RAM spikes
+        n_jobs=-1,          # use all CPU cores
         max_depth=12,
-        max_samples=0.6,    # each tree sees 60% of rows
-        max_features=0.7,
+        max_samples=0.8,    # each tree sees 80% of rows
+        max_features=0.8,
     )
     print(f"\n  [{name}] {EPOCHS} epochs × {trees_per_epoch} trees = {TREES_TOTAL} total")
     mae = None
@@ -77,8 +68,8 @@ def train_gb(X_train, y_train, X_test, y_test, name="gradient_boosting"):
     model = GradientBoostingRegressor(
         n_estimators=0, warm_start=True, random_state=42,
         max_depth=4,
-        subsample=0.6,
-        max_features=0.7,
+        subsample=0.8,
+        max_features=0.8,
     )
     print(f"\n  [{name}] {EPOCHS} epochs × {trees_per_epoch} trees = {TREES_TOTAL} total")
     mae = None
@@ -110,9 +101,9 @@ def train_xgb(X_train, y_train, X_test, y_test, name="xgboost"):
         eval_metric="mae",
         tree_method="hist",    # low RAM histogram method
         max_depth=6,
-        subsample=0.6,
-        colsample_bytree=0.7,
-        nthread=1,             # single thread = no RAM spikes
+        subsample=0.8,
+        colsample_bytree=0.8,
+        nthread=-1,            # use all CPU cores
         callbacks=[EpochPrinter()]
     )
     model.fit(X_train, y_train, eval_set=[(X_test, y_test)], verbose=False)
@@ -132,11 +123,8 @@ def train_simple(name, model, X_train, y_train, X_test, y_test):
 
 
 def train_all():
-    df    = load_data()
-    # float32 = half the RAM of float64
-    X     = df[FEATURE_COLS].values.astype(np.float32)
-    y     = df["temperature"].values.astype(np.float32)
-    del df; gc.collect()
+    X, y = load_data()   # already float32, features engineered
+    gc.collect()
 
     split = int(len(X) * 0.8)
     X_train, X_test = X[:split], X[split:]
@@ -165,7 +153,7 @@ def train_all():
         ("decision_tree",     DecisionTreeRegressor(max_depth=12, random_state=42)),
         ("linear_regression", LinearRegression()),
         ("ridge",             Ridge(alpha=1.0)),
-        ("knn",               KNeighborsRegressor(n_neighbors=5, n_jobs=1)),
+        ("knn",               KNeighborsRegressor(n_neighbors=5, n_jobs=-1)),
     ]:
         model, mae = train_simple(fname, mdl, X_train, y_train, X_test, y_test)
         joblib.dump(model, MODELS_DIR / f"model_{fname}.pkl")

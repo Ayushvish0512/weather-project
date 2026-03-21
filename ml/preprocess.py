@@ -1,16 +1,33 @@
 """
 ml/preprocess.py
-Loads and prepares data from CSV files (not DB).
+Loads CSVs and engineers all features including lag, rolling, and derived columns.
 """
 import glob
+import numpy as np
 import pandas as pd
+from pathlib import Path
 
-FEATURE_COLS = ["hour", "day_of_week", "month", "humidity", "dew_point",
-                "pressure", "cloudcover", "wind_speed", "wind_direction", "wind_gusts"]
+ROOT = Path(__file__).resolve().parent.parent
+
+FEATURE_COLS = [
+    # Time
+    "hour", "day_of_week", "month", "season", "is_daytime",
+    # Raw weather
+    "humidity", "dew_point", "pressure", "cloudcover",
+    "wind_speed", "wind_direction", "wind_gusts",
+    "feels_like", "precipitation", "rain", "weather_main",
+    # Derived
+    "humidity_pressure_ratio",
+    "daily_temp_max", "daily_temp_min",
+    # Lag features (most powerful for time-series)
+    "temp_lag_1h", "temp_lag_3h", "temp_lag_24h",
+    # Rolling stats
+    "temp_rolling_mean_6h", "temp_rolling_std_6h",
+]
 
 
 def load_raw_data() -> pd.DataFrame:
-    files = sorted(glob.glob("data/weather_*.csv"))
+    files = sorted(glob.glob(str(ROOT / "data" / "weather_*.csv")))
     if not files:
         raise FileNotFoundError("No CSV files in data/. Run data/bootstrap.py first.")
     df = pd.concat([pd.read_csv(f) for f in files], ignore_index=True)
@@ -21,12 +38,38 @@ def load_raw_data() -> pd.DataFrame:
 
 def engineer_features(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
-    df["hour"]        = df["recorded_at"].dt.hour
-    df["day_of_week"] = df["recorded_at"].dt.dayofweek
-    df["month"]       = df["recorded_at"].dt.month
+    dt = df["recorded_at"]
+
+    # Time features
+    df["hour"]       = dt.dt.hour
+    df["day_of_week"]= dt.dt.dayofweek
+    df["month"]      = dt.dt.month
+    df["season"]     = (dt.dt.month % 12 // 3)   # 0=winter 1=spring 2=summer 3=autumn
+    df["is_daytime"] = dt.dt.hour.between(6, 18).astype(int)
+
+    # Derived
+    df["humidity_pressure_ratio"] = df["humidity"] / df["pressure"].replace(0, np.nan)
+
+    # Daily min/max up to current hour (expanding within each day)
+    date_col = dt.dt.date
+    df["daily_temp_max"] = df.groupby(date_col)["temperature"].cummax()
+    df["daily_temp_min"] = df.groupby(date_col)["temperature"].cummin()
+
+    # Lag features — shift within sorted time series
+    df["temp_lag_1h"]  = df["temperature"].shift(1)
+    df["temp_lag_3h"]  = df["temperature"].shift(3)
+    df["temp_lag_24h"] = df["temperature"].shift(24)
+
+    # Rolling stats (min_periods so early rows aren't all NaN)
+    df["temp_rolling_mean_6h"] = df["temperature"].rolling(6, min_periods=1).mean()
+    df["temp_rolling_std_6h"]  = df["temperature"].rolling(6, min_periods=1).std().fillna(0)
+
     return df
 
 
 def get_features_and_target(df: pd.DataFrame):
     df = engineer_features(df)
-    return df[FEATURE_COLS].values, df["temperature"].values
+    df = df.dropna(subset=FEATURE_COLS)
+    X = df[FEATURE_COLS].values.astype("float32")
+    y = df["temperature"].values.astype("float32")
+    return X, y

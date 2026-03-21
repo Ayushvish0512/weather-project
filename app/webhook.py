@@ -1,20 +1,24 @@
 import os
+import sys
 import joblib
 import httpx
 import numpy as np
+from pathlib import Path
 from datetime import datetime, timedelta
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
+ROOT = Path(__file__).resolve().parent.parent
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
 router = APIRouter(prefix="/webhook", tags=["webhook"])
 
-MODEL_PATH = "ml/model.pkl"
+MODEL_PATH = str(ROOT / "ml" / "model.pkl")
 
 # In-memory store for registered webhook URLs.
-# In production, persist these in the database.
 _webhook_urls: list[str] = []
 
-# Allow a default webhook via env var
 _default = os.getenv("WEBHOOK_URL")
 if _default:
     _webhook_urls.append(_default)
@@ -24,32 +28,36 @@ class WebhookConfig(BaseModel):
     url: str
 
 
-def _build_prediction(hours_ahead: int = 1) -> dict:
+def _build_prediction(hours_ahead: int = 1) -> dict | None:
     try:
+        import glob
+        import pandas as pd
+        from ml.preprocess import engineer_features, FEATURE_COLS
+
         model = joblib.load(MODEL_PATH)
-    except FileNotFoundError:
-        return None
+        files = sorted(glob.glob(str(ROOT / "data" / "weather_*.csv")))
+        if not files:
+            return None
 
-    import glob, pandas as pd
-    files = sorted(glob.glob("data/weather_*.csv"))
-    if not files:
-        return None
-    row = pd.read_csv(files[-1]).iloc[-1]
+        df = pd.read_csv(files[-1]).tail(30).copy()
+        df["recorded_at"] = pd.to_datetime(df["recorded_at"])
+        df = df.sort_values("recorded_at").reset_index(drop=True)
+        df = engineer_features(df)
+        df.dropna(subset=FEATURE_COLS, inplace=True)
+        if df.empty:
+            return None
 
-    future_time = datetime.utcnow().replace(minute=0, second=0, microsecond=0) + timedelta(hours=hours_ahead)
-    features = np.array([[
-        future_time.hour, future_time.weekday(), future_time.month,
-        float(row["humidity"]), float(row["dew_point"]), float(row["pressure"]),
-        float(row["cloudcover"]), float(row["wind_speed"]),
-        float(row["wind_direction"]), float(row["wind_gusts"]),
-    ]])
-    temp = model.predict(features)[0]
-    return {
-        "predicted_temperature": round(float(temp), 2),
-        "hours_ahead": hours_ahead,
-        "prediction_for": future_time.isoformat() + "Z",
-        "sent_at": datetime.utcnow().isoformat() + "Z"
-    }
+        features = df[FEATURE_COLS].iloc[-1].values.astype("float32").reshape(1, -1)
+        future_time = datetime.utcnow().replace(minute=0, second=0, microsecond=0) + timedelta(hours=hours_ahead)
+        temp = model.predict(features)[0]
+        return {
+            "predicted_temperature": round(float(temp), 2),
+            "hours_ahead": hours_ahead,
+            "prediction_for": future_time.isoformat() + "Z",
+            "sent_at": datetime.utcnow().isoformat() + "Z"
+        }
+    except Exception:
+        return None
 
 
 async def dispatch_to_webhooks(hours_ahead: int = 1):
