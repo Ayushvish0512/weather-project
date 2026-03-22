@@ -757,3 +757,198 @@ The project is complete when:
 - Weekly retraining runs without manual intervention
 - API is publicly accessible on Render
 - Webhook pushes next-hour prediction to n8n every hour
+
+
+---
+
+## Problems
+
+Known challenges, limitations, and technical debt in this project. Grouped by category with root cause, current impact, and recommended fix.
+
+---
+
+### 1. Data Quality
+
+**`weathercode` treated as a continuous number**
+
+- Root cause: `weathercode` is a WMO categorical code (0 = clear, 95 = thunderstorm). It's stored and fed to the model as a raw integer. The model interprets 95 as "greater than" 3, implying thunderstorm is just a "bigger" version of cloudy — which is mathematically wrong.
+- Impact: Tree models partially work around this by splitting on thresholds, but linear models and KNN are actively misled. The feature contributes noise instead of signal.
+- Fix: One-hot encode `weathercode` into buckets in `ml/preprocess.py`:
+  ```python
+  bins = [0, 3, 45, 67, 77, 82, 99]
+  labels = ["clear", "cloudy", "fog", "rain", "snow", "showers", "storm"]
+  df["weather_bucket"] = pd.cut(df["weather_main"], bins=bins, labels=labels)
+  df = pd.get_dummies(df, columns=["weather_bucket"])
+  ```
+- Status: not fixed — `weather_main` is currently passed as raw int
+
+---
+
+**Lag features break at CSV file boundaries**
+
+- Root cause: `temp_lag_1h = temperature.shift(1)` is computed per-file when files are loaded individually. The last row of `weather_2023.csv` and the first row of `weather_2024.csv` are 1 hour apart in real time, but `shift(1)` across the concatenated DataFrame doesn't know this — it works correctly only because `load_raw_data()` concatenates all CSVs before engineering. However, if a file is missing or has a gap, the shift silently produces a NaN which gets dropped.
+- Impact: A few rows lost per year boundary — negligible for training accuracy, but worth knowing when debugging row count mismatches.
+- Fix: After concat and sort, validate that `recorded_at` has no gaps larger than 1 hour before computing lags. Log a warning if gaps are found.
+- Status: not fixed — gaps are silently dropped via `dropna`
+
+---
+
+**Missing or null hours in archive data**
+
+- Root cause: Open-Meteo archive occasionally has null values for specific hours, especially `precipitation` and `visibility`. The current `dropna(subset=["temperature", "humidity", "pressure"])` only drops rows missing the three core columns — other nulls propagate into features.
+- Impact: Null values in `wind_gusts` or `dew_point` become `NaN` in derived features, which some models handle differently (tree models ignore, linear models fail silently or produce NaN predictions).
+- Fix: Add forward-fill for weather columns before feature engineering:
+  ```python
+  df[numeric_cols] = df[numeric_cols].ffill().bfill()
+  ```
+- Status: partial — only critical columns are checked
+
+---
+
+### 2. Model Drift
+
+**Extreme seasonality in Gurgaon**
+
+- Root cause: Gurgaon has one of the widest temperature ranges in India — ~5°C in January, ~45°C in May/June. A model trained on a full year handles this, but if weekly retraining is skipped for several weeks during a seasonal transition, the model's recent-data weighting drifts.
+- Impact: Predictions can be 3–5°C off during rapid seasonal transitions (Feb→Mar, Oct→Nov).
+- Fix: Weight recent data more heavily during training using `sample_weight`:
+  ```python
+  # Give last 90 days 3x weight
+  weights = np.where(df["recorded_at"] > cutoff_90d, 3.0, 1.0)
+  model.fit(X_train, y_train, sample_weight=weights)
+  ```
+- Status: not implemented — all rows weighted equally
+
+---
+
+**Year-over-year climate shift**
+
+- Root cause: 2024 and 2025 summers in Gurgaon were measurably hotter than 2020–2022. A model trained equally on all years may underpredict peak summer temperatures.
+- Impact: Systematic underprediction during heatwaves — the model has never seen those temperatures in training.
+- Fix: Track mean error (bias) per month in `model_metrics`. If June bias > +2°C, trigger retraining with higher weight on recent summers.
+- Status: not implemented — only MAE/RMSE tracked, no bias per season
+
+---
+
+### 3. Prediction Quality
+
+**Multi-hour forecast uses stale lag features**
+
+- Root cause: `/predict/hours?hours=6` calls `get_latest_features()` once and reuses the same feature vector for all 6 hours. The lag features (`temp_lag_1h`, `temp_lag_3h`, `temp_rolling_mean_6h`) are computed from the last real CSV row — they don't update as the forecast rolls forward.
+- Impact: Hour 1 prediction is accurate. Hours 2–6 are essentially the same prediction repeated with only the `hour` field changing. The further ahead, the less meaningful the result.
+- Fix: Implement autoregressive forecasting — feed each prediction back as the next hour's lag:
+  ```python
+  predicted_temps = []
+  lag_window = list(df["temperature"].tail(24))  # seed with real data
+
+  for h in range(1, hours + 1):
+      features = build_features_from_lag(lag_window, hour=(now + timedelta(hours=h)).hour)
+      temp = model.predict(features)[0]
+      predicted_temps.append(temp)
+      lag_window.append(temp)   # use prediction as next lag input
+      lag_window.pop(0)
+  ```
+- Status: not fixed — all forecast hours use identical lag features
+
+---
+
+**No prediction confidence interval**
+
+- Root cause: All models return a single point estimate. There's no measure of uncertainty.
+- Impact: A prediction of "28.4°C" with no range is misleading — the model could be ±0.2°C or ±4°C depending on conditions, and the API consumer has no way to know.
+- Fix: Use `RandomForest` individual tree predictions to estimate spread:
+  ```python
+  tree_preds = np.array([t.predict(X) for t in model.estimators_])
+  mean = tree_preds.mean(axis=0)
+  std  = tree_preds.std(axis=0)
+  # Return: predicted=28.4, confidence_low=27.8, confidence_high=29.0
+  ```
+- Status: not implemented
+
+---
+
+### 4. Evaluation Gap
+
+**`ml/evaluate.py` returns zero rows if `data/collect.py` isn't running**
+
+- Root cause: Evaluation JOINs `weather_predictions` (predictions stored by the API) with `weather_raw` (actuals stored by `data/collect.py`). If the live collection cron job isn't running, `weather_raw` stays empty and the JOIN returns nothing.
+- Impact: You can generate predictions all day but have no way to measure their accuracy unless the live collector is also running. On Render free tier, the service sleeps — so the cron never fires.
+- Fix: Either (a) run `data/collect.py` as a separate Render cron job, or (b) backfill actuals from Open-Meteo archive after the fact:
+  ```python
+  # Fetch yesterday's actuals and insert into weather_raw for evaluation
+  .\venv\Scripts\python.exe data/bootstrap.py  # already handles gap fill
+  ```
+- Status: evaluation is non-functional unless collect.py is running continuously
+
+---
+
+**No bias tracking — only absolute error**
+
+- Root cause: `model_metrics` stores MAE and RMSE only. These are symmetric — a model that's always 2°C too high looks the same as one that's randomly ±2°C.
+- Impact: Systematic seasonal bias goes undetected. You might retrain and get the same MAE but the model is still always wrong in the same direction.
+- Fix: Add `mean_error` (signed) to `model_metrics`:
+  ```python
+  mean_error = float(np.mean(predicted - actual))  # positive = model runs hot
+  ```
+  And track per-month breakdown to catch seasonal drift early.
+- Status: not implemented
+
+---
+
+### 5. Infrastructure
+
+**Render free tier sleeps — hourly webhook scheduler dies**
+
+- Root cause: Render free tier web services sleep after 15 minutes of inactivity. The `asyncio` background task in `app/main.py` that fires webhooks every hour is killed when the process sleeps.
+- Impact: Webhook pushes are unreliable. The n8n workflow won't receive data during sleep periods, which could be most of the day if the API isn't being actively called.
+- Fix options:
+  - Use an external cron service (cron-job.org, GitHub Actions scheduled workflow) to ping `/webhook/send` every hour — this also keeps the service awake
+  - Upgrade to Render paid tier (no sleep)
+  - Move webhook dispatch to a separate Render cron job service
+- Status: known limitation — no fix implemented
+
+---
+
+**`model.pkl` committed to Git — binary blob history grows**
+
+- Root cause: `model.pkl` and all `model_*.pkl` files are tracked in Git. Each weekly retrain produces a new binary version. Git stores the full file each time (binary files don't diff).
+- Impact: After 6 months of weekly retraining, the repo history could contain 200+ MB of `.pkl` blobs. `git clone` becomes slow.
+- Fix: Add to `.gitignore`:
+  ```
+  ml/*.pkl
+  ```
+  Then store model files on Render Disk, S3, or use DVC (Data Version Control) for proper ML artifact versioning.
+- Status: `.pkl` files are currently tracked in Git
+
+---
+
+**Webhook URL list is in-memory — lost on every restart**
+
+- Root cause: `_webhook_urls` in `app/webhook.py` is a Python list. Any URL registered via `POST /webhook/register` is lost when the process restarts or Render redeploys.
+- Impact: Only the `WEBHOOK_URL` from `.env` survives restarts. Any dynamically registered URLs (e.g. from a frontend or n8n workflow) are silently dropped.
+- Fix: Persist registered URLs in the database:
+  ```sql
+  CREATE TABLE webhook_subscriptions (
+      id SERIAL PRIMARY KEY,
+      url TEXT UNIQUE NOT NULL,
+      created_at TIMESTAMP DEFAULT NOW()
+  );
+  ```
+  Load on startup, write on register, delete on unregister.
+- Status: in-memory only — not persisted
+
+---
+
+### Priority Summary
+
+| Problem | Impact | Effort | Fix Now? |
+|---|---|---|---|
+| `weathercode` one-hot encoding | Medium — misleads linear models | Low | Yes |
+| Multi-hour forecast stale lags | High — hours 2–24 are unreliable | Medium | Yes |
+| Evaluation needs collect.py running | High — can't measure accuracy | Low | Yes |
+| Webhook URLs lost on restart | Medium — n8n URL survives via .env | Low | Yes |
+| Render sleep kills webhook scheduler | Medium — missed hourly pushes | Low | Yes (external cron) |
+| No confidence interval | Low — nice to have | Medium | Later |
+| Bias tracking per season | Low — diagnostic improvement | Low | Later |
+| Sample weighting for recent data | Medium — better seasonal accuracy | Medium | Later |
+| `.pkl` files in Git | Low — repo size issue over time | Low | Later |
