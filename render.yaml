@@ -1,0 +1,17 @@
+services:
+  - type: web
+    name: weather-ml
+    runtime: python
+    region: singapore
+    branch: main
+    buildCommand: pip install -r render_requirements.txt
+    startCommand: uvicorn app.main:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: MODEL_VERSION
+        value: v1
+      - key: WEATHER_CITY
+        value: Gurgaon
+      - key: DATABASE_URL
+        sync: false        # set manually in Render dashboard — never commit DB credentials
+      - key: WEBHOOK_URL
+        sync: false        # set manually if using n8n webhook

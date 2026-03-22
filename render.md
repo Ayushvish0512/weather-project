@@ -63,11 +63,15 @@ git push
 
 ## Step 2 — Render Setup
 
+A `render.yaml` file is included in the repo. Render reads it automatically and pre-fills the build command, start command, region, and non-secret env vars. You only need to set `DATABASE_URL` and optionally `WEBHOOK_URL` manually.
+
 ### 2a. Create a Web Service on Render
 
 1. Go to [render.com](https://render.com) → New → Web Service
 2. Connect your GitHub repo
-3. Set these fields:
+3. Render detects `render.yaml` and pre-fills everything — review and click Deploy
+
+If you prefer to set fields manually instead of using `render.yaml`:
 
 | Field | Value |
 |---|---|
@@ -78,26 +82,49 @@ git push
 | Build Command | `pip install -r render_requirements.txt` |
 | Start Command | `uvicorn app.main:app --host 0.0.0.0 --port $PORT` |
 
-> Do NOT use `--reload` on Render — that's for local dev only. Render sets `$PORT` automatically.
+**Build Command** — installs only the minimal inference dependencies:
+```
+pip install -r render_requirements.txt
+```
+
+**Start Command** — launches the FastAPI server on the port Render assigns:
+```
+uvicorn app.main:app --host 0.0.0.0 --port $PORT
+```
+
+> Do NOT use `--reload` on Render — that's for local dev only. Render sets `$PORT` automatically, do not hardcode a port number.
 
 ### 2b. Set Environment Variables on Render
 
 Go to your service → Environment → Add these:
 
-| Key | Value |
-|---|---|
-| `DATABASE_URL` | Your Render PostgreSQL internal URL |
-| `MODEL_VERSION` | `v1` |
-| `WEATHER_CITY` | `Gurgaon` |
-| `WEBHOOK_URL` | `https://n8n-29o4.onrender.com/webhook/weather` (optional) |
+| Key | Value | Required |
+|---|---|---|
+| `DATABASE_URL` | Internal PostgreSQL URL from Render DB | ✅ Yes |
+| `MODEL_VERSION` | `v1` | ✅ Yes |
+| `WEATHER_CITY` | `Gurgaon` | Optional |
+| `WEBHOOK_URL` | `https://n8n-29o4.onrender.com/webhook/weather` | Optional |
 
 > `OPENWEATHER_API_KEY` is only needed if `data/collect.py` runs on Render. For this setup it's not required.
 
-### 2c. Create PostgreSQL on Render (if not already done)
+Where to find these on Render:
 
-1. Render Dashboard → New → PostgreSQL
-2. Copy the **Internal Database URL**
-3. Paste it as `DATABASE_URL` in your Web Service environment variables
+```
+Render Dashboard
+  → Your Web Service
+    → Environment (left sidebar)
+      → Add Environment Variable
+```
+
+For `DATABASE_URL` specifically:
+```
+Render Dashboard
+  → Your PostgreSQL service
+    → Connections tab
+      → Internal Database URL   ← copy this (not External URL)
+```
+
+The Internal URL only works between Render services in the same region. It's faster and doesn't count against bandwidth limits.
 
 ---
 
@@ -238,10 +265,14 @@ Render auto-deploys on push. The new `model.pkl` is live within ~2 minutes.
 ## File Checklist Before Deploying
 
 ```
-✅ ml/model.pkl          — trained model (committed to Git)
-✅ data/weather_*.csv    — historical data for feature engineering
-✅ requirements.txt      — all dependencies (torch NOT listed — not needed for inference)
-✅ .env                  — NOT committed (use Render environment variables instead)
-✅ app/main.py           — FastAPI entry point
-✅ db/postgres.py        — DB connection using DATABASE_URL from env
+✅ ml/model.pkl               — trained model (committed to Git)
+✅ data/weather_*.csv         — historical data for feature engineering
+✅ render_requirements.txt    — minimal Render dependencies (no torch/sklearn/xgboost)
+✅ app/main.py                — FastAPI entry point
+✅ app/predict.py             — prediction endpoints
+✅ app/webhook.py             — webhook endpoints
+✅ db/postgres.py             — DB connection using DATABASE_URL from env
+✅ ml/preprocess.py           — feature engineering (needed at prediction time)
+❌ .env                       — NOT committed — use Render environment variables instead
+❌ venv/                      — NOT committed — Render builds its own
 ```
