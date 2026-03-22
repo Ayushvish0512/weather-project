@@ -1,20 +1,32 @@
 """
 ml/train_all.py
-100 epochs, RAM-safe:
+RAM-safe multi-model training with GPU enforcement layer.
+
+GPU behaviour:
+- Imports gpu_setup.py for full environment validation at startup
+- FORCE_GPU = False  → warns if GPU missing, continues on CPU
+- FORCE_GPU = True   → hard-fails if GPU not available
+- XGBoost uses CUDA when available; sklearn models always run on CPU
+- PyTorch MLP competes as a GPU model when torch is installed
+- Each model prints which device it is using before training
+
+RAM safety:
 - Models trained and saved one at a time (never held in memory together)
 - gc.collect() + del between each model
 - numpy arrays kept as float32 (half the RAM of float64)
 - XGBoost uses hist tree method (low RAM)
 - RF/GB use max_samples + max_features to limit per-tree memory
-- GPU auto-detected: uses CUDA if available, falls back to CPU silently
+
+Data freshness:
+- Checks if CSVs contain data up to yesterday (D-1) before training
+- Prompts to download missing data or proceed with what exists
 """
 import os
 import gc
 import sys
-import glob
 import joblib
 import numpy as np
-import pandas as pd
+from datetime import date, timedelta
 from pathlib import Path
 from sklearn.linear_model import LinearRegression, Ridge
 from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor
@@ -24,50 +36,125 @@ from sklearn.preprocessing import StandardScaler
 from sklearn.pipeline import Pipeline
 from sklearn.metrics import mean_absolute_error
 from xgboost import XGBRegressor, callback
+import time
 
-# Ensure project root is on sys.path so ml.preprocess resolves
-# regardless of working directory or how the script is invoked
+# ── PyTorch MLP — defined at module level so joblib/pickle can serialize it ──
+# (classes defined inside functions cannot be pickled — Python limitation)
+try:
+    import torch
+    import torch.nn as nn
+
+    class MLP(nn.Module):
+        """Simple feedforward network for tabular regression."""
+        def __init__(self, n_features: int):
+            super().__init__()
+            self.layers = nn.Sequential(
+                nn.Linear(n_features, 128), nn.ReLU(), nn.Dropout(0.2),
+                nn.Linear(128, 64),         nn.ReLU(), nn.Dropout(0.2),
+                nn.Linear(64, 1)
+            )
+        def forward(self, x):
+            return self.layers(x)
+
+    class TorchRegressorWrapper:
+        """
+        Wraps a trained MLP + its StandardScaler into a sklearn-compatible
+        interface so it can be saved with joblib and used by ml/predict.py
+        via model.predict(X).
+        """
+        def __init__(self, model: MLP, scaler: StandardScaler):
+            self.model  = model
+            self.scaler = scaler
+
+        def predict(self, X: np.ndarray) -> np.ndarray:
+            import torch
+            self.model.eval()
+            Xs = self.scaler.transform(X)
+            t  = torch.tensor(Xs, dtype=torch.float32)
+            with torch.no_grad():
+                out = self.model(t).squeeze(1).numpy()
+            return out
+
+    _TORCH_AVAILABLE = True
+
+except ImportError:
+    _TORCH_AVAILABLE = False
+
+# ── Project root on sys.path so imports work from any working directory ──────
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from ml.preprocess import load_raw_data, engineer_features, get_features_and_target, FEATURE_COLS
+from ml.preprocess import load_raw_data, get_features_and_target, FEATURE_COLS
+from ml.gpu_setup import validate_gpu, detect_gpu, device_label
 
 ROOT       = Path(__file__).resolve().parent.parent
 MODELS_DIR = ROOT / "ml"
 
-EPOCHS      = 10
-TREES_TOTAL = 50
+# ── Config ───────────────────────────────────────────────────────────────────
+EPOCHS      = 20
+TREES_TOTAL = 100
 CPU_CORES   = os.cpu_count() or 4
 
+# Set True to hard-fail if GPU is not available instead of silently using CPU
+FORCE_GPU   = False
 
-def detect_gpu() -> str:
-    """Return 'cuda' if a CUDA GPU is available, else 'cpu'."""
-    try:
-        import json, warnings
-        _X = np.ones((4, 2), dtype="float32")
-        _y = np.ones(4, dtype="float32")
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore")
-            _m = XGBRegressor(device="cuda", n_estimators=1, verbosity=0)
-            _m.fit(_X, _y)
-        cfg = json.loads(_m.get_booster().save_config())
-        device = cfg.get("learner", {}).get("generic_param", {}).get("device", "cpu")
-        return device if device == "cuda" else "cpu"
-    except Exception:
-        return "cpu"
+
+def _latest_csv_date():
+    """Return the latest recorded_at date found across all CSVs (fast — reads last row only)."""
+    import pandas as pd
+    csvs = sorted((ROOT / "data").glob("weather_*.csv"))
+    if not csvs:
+        return None
+    df_tail = pd.read_csv(csvs[-1], usecols=["recorded_at"]).tail(1)
+    if df_tail.empty:
+        return None
+    return pd.to_datetime(df_tail["recorded_at"].iloc[0]).date()
+
+
+def _check_data_freshness():
+    """
+    Check if CSVs contain data up to yesterday (D-1).
+    Prompts the user: Y = run bootstrap first, N = train on existing data.
+    """
+    yesterday = date.today() - timedelta(days=1)
+    latest    = _latest_csv_date()
+
+    if latest is None:
+        print("No CSV files found in data/. Running bootstrap to download data...")
+        _run_bootstrap()
+        return
+
+    gap_days = (yesterday - latest).days
+
+    if gap_days <= 0:
+        print(f"✅ Data is up to date — latest row: {latest}  (yesterday: {yesterday})")
+        return
+
+    print(f"\n⚠️  Data is {gap_days} day(s) behind.")
+    print(f"   Latest row in CSVs : {latest}")
+    print(f"   Yesterday (D-1)    : {yesterday}")
+    print(f"   Missing            : {gap_days} day(s) of hourly data\n")
+
+    answer = input("Download missing data before training? [Y/n]: ").strip().lower()
+    if answer in ("", "y", "yes"):
+        _run_bootstrap()
+    else:
+        print(f"Proceeding with existing data (up to {latest}). Training may miss recent patterns.\n")
+
+
+def _run_bootstrap():
+    import subprocess
+    print("Running data/bootstrap.py ...\n")
+    result = subprocess.run(
+        [sys.executable, str(ROOT / "data" / "bootstrap.py")],
+        cwd=str(ROOT)
+    )
+    if result.returncode != 0:
+        raise RuntimeError("Bootstrap failed. Run data/bootstrap.py manually to debug.")
+    print("Bootstrap complete. Continuing with training...\n")
 
 
 def load_data():
-    # Auto-download data if CSVs are missing
-    if not list((ROOT / "data").glob("weather_*.csv")):
-        print("No CSV files found in data/. Running bootstrap to download data...")
-        import subprocess
-        result = subprocess.run(
-            [sys.executable, str(ROOT / "data" / "bootstrap.py")],
-            cwd=str(ROOT)
-        )
-        if result.returncode != 0:
-            raise RuntimeError("Bootstrap failed. Check your internet connection and try running data/bootstrap.py manually.")
-        print("Bootstrap complete. Continuing with training...\n")
-
+    """Check data freshness, optionally sync, then load all CSVs."""
+    _check_data_freshness()
     df = load_raw_data()
     X, y = get_features_and_target(df)
     return X, y
@@ -81,33 +168,33 @@ def free(model):
 
 def train_rf(X_train, y_train, X_test, y_test, name="random_forest"):
     trees_per_epoch = TREES_TOTAL // EPOCHS
+    print(f"\n  [{name}] {device_label(name, 'cpu')}  |  {EPOCHS} epochs × {trees_per_epoch} trees = {TREES_TOTAL} total")
     model = RandomForestRegressor(
         n_estimators=0, warm_start=True, random_state=42,
-        n_jobs=-1,          # use all CPU cores
+        n_jobs=-1,
         max_depth=12,
-        max_samples=0.8,    # each tree sees 80% of rows
+        max_samples=0.8,
         max_features=0.8,
     )
-    print(f"\n  [{name}] {EPOCHS} epochs × {trees_per_epoch} trees = {TREES_TOTAL} total")
     mae = None
     for epoch in range(1, EPOCHS + 1):
         model.n_estimators = epoch * trees_per_epoch
         model.fit(X_train, y_train)
         mae = mean_absolute_error(y_test, model.predict(X_test))
         print(f"    Epoch {epoch:>3}/{EPOCHS} — trees: {model.n_estimators:>4}  MAE: {mae:.4f}°C")
-        gc.collect()   # free intermediate memory each epoch
+        gc.collect()
     return model, mae
 
 
 def train_gb(X_train, y_train, X_test, y_test, name="gradient_boosting"):
     trees_per_epoch = TREES_TOTAL // EPOCHS
+    print(f"\n  [{name}] {device_label(name, 'cpu')}  |  {EPOCHS} epochs × {trees_per_epoch} trees = {TREES_TOTAL} total")
     model = GradientBoostingRegressor(
         n_estimators=0, warm_start=True, random_state=42,
         max_depth=4,
         subsample=0.8,
         max_features=0.8,
     )
-    print(f"\n  [{name}] {EPOCHS} epochs × {trees_per_epoch} trees = {TREES_TOTAL} total")
     mae = None
     for epoch in range(1, EPOCHS + 1):
         model.n_estimators = epoch * trees_per_epoch
@@ -119,7 +206,7 @@ def train_gb(X_train, y_train, X_test, y_test, name="gradient_boosting"):
 
 
 def train_xgb(X_train, y_train, X_test, y_test, name="xgboost", device="cpu"):
-    print(f"\n  [{name}] {TREES_TOTAL} rounds — printing every {TREES_TOTAL // EPOCHS}  [device: {device}]")
+    print(f"\n  [{name}] {device_label(name, device)}  |  {TREES_TOTAL} rounds — printing every {TREES_TOTAL // EPOCHS}")
 
     class EpochPrinter(callback.TrainingCallback):
         def after_iteration(self, model, epoch, evals_log):
@@ -143,7 +230,9 @@ def train_xgb(X_train, y_train, X_test, y_test, name="xgboost", device="cpu"):
         nthread=CPU_CORES,
         callbacks=[EpochPrinter()]
     )
+    start = time.time()
     model.fit(X_train, y_train, eval_set=[(X_test, y_test)], verbose=False)
+    print(f"    Completed in {time.time() - start:.2f}s")
     model.set_params(callbacks=None)
     mae = mean_absolute_error(y_test, model.predict(X_test))
     gc.collect()
@@ -151,7 +240,7 @@ def train_xgb(X_train, y_train, X_test, y_test, name="xgboost", device="cpu"):
 
 
 def train_simple(name, model, X_train, y_train, X_test, y_test):
-    print(f"\n  [{name}] single pass (no epochs)")
+    print(f"\n  [{name}] {device_label(name, 'cpu')}  |  single pass (no epochs)")
     model.fit(X_train, y_train)
     mae = mean_absolute_error(y_test, model.predict(X_test))
     print(f"    MAE: {mae:.4f}°C")
@@ -159,11 +248,61 @@ def train_simple(name, model, X_train, y_train, X_test, y_test):
     return model, mae
 
 
+def train_torch_gpu(X_train, y_train, X_test, y_test, name="torch_gpu"):
+    if not _TORCH_AVAILABLE:
+        print(f"\n  [{name}] skipped — PyTorch not installed")
+        print("    Install: pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121")
+        return None, float("inf")
+
+    try:
+        import torch
+
+        scaler    = StandardScaler()
+        X_train_s = scaler.fit_transform(X_train)
+        X_test_s  = scaler.transform(X_test)
+
+        dev = "cuda" if torch.cuda.is_available() else "cpu"
+        print(f"\n  [{name}] {device_label(name, dev)}")
+
+        X_train_t = torch.tensor(X_train_s, dtype=torch.float32).to(dev)
+        X_test_t  = torch.tensor(X_test_s,  dtype=torch.float32).to(dev)
+        y_train_t = torch.tensor(y_train,   dtype=torch.float32).unsqueeze(1).to(dev)
+        y_test_t  = torch.tensor(y_test,    dtype=torch.float32).unsqueeze(1)
+
+        net       = MLP(n_features=X_train_t.shape[1]).to(dev)
+        criterion = torch.nn.MSELoss()
+        optimizer = torch.optim.Adam(net.parameters(), lr=0.001)
+
+        net.train()
+        for epoch in range(100):
+            optimizer.zero_grad()
+            loss = criterion(net(X_train_t), y_train_t)
+            loss.backward()
+            optimizer.step()
+            if epoch % 20 == 0:
+                print(f"    Epoch {epoch:>3}  loss: {loss.item():.4f}")
+
+        net.eval()
+        with torch.no_grad():
+            mae = torch.mean(torch.abs(net(X_test_t).cpu() - y_test_t)).item()
+        print(f"    MAE: {mae:.4f}°C")
+
+        # Wrap with scaler so predict(X) works identically to sklearn models
+        wrapper = TorchRegressorWrapper(model=net.cpu(), scaler=scaler)
+        return wrapper, mae
+
+    except Exception as e:
+        print(f"\n  [{name}] failed: {e}")
+        return None, float("inf")
+
 def train_all():
+    # ── GPU enforcement — runs checks, prints results, fails if FORCE_GPU=True ──
+    validate_gpu(require_gpu=FORCE_GPU)
+
     device = detect_gpu()
     print(f"Device: {device.upper()}  |  CPU cores: {CPU_CORES}")
 
-    X, y = load_data()   # already float32, features engineered
+    X, y = load_data()
     gc.collect()
 
     split = int(len(X) * 0.8)
@@ -177,22 +316,22 @@ def train_all():
 
     summary = {}
 
-    # ── Train one model at a time, save immediately, then free RAM ──
-
+    # GPU-capable models
     for train_fn, fname in [
-        (lambda: train_rf(X_train, y_train, X_test, y_test),                  "random_forest"),
-        (lambda: train_gb(X_train, y_train, X_test, y_test),                  "gradient_boosting"),
-        (lambda: train_xgb(X_train, y_train, X_test, y_test, device=device),  "xgboost"),
+        (lambda: train_rf(X_train, y_train, X_test, y_test),                 "random_forest"),
+        (lambda: train_gb(X_train, y_train, X_test, y_test),                 "gradient_boosting"),
+        (lambda: train_xgb(X_train, y_train, X_test, y_test, device=device), "xgboost"),
+        (lambda: train_torch_gpu(X_train, y_train, X_test, y_test),          "torch_gpu"),
     ]:
         model, mae = train_fn()
-        joblib.dump(model, MODELS_DIR / f"model_{fname}.pkl")
-        summary[fname] = mae
-        free(model)
+        if model is not None:
+            joblib.dump(model, MODELS_DIR / f"model_{fname}.pkl")
+            summary[fname] = mae
+            free(model)
 
+    # CPU-only sklearn models
     for fname, mdl in [
         ("decision_tree",     DecisionTreeRegressor(max_depth=12, random_state=42)),
-        # Linear models and KNN need feature scaling — wrap in Pipeline to fix
-        # the ill-conditioned matrix warning and improve accuracy
         ("linear_regression", Pipeline([("scaler", StandardScaler()), ("model", LinearRegression())])),
         ("ridge",             Pipeline([("scaler", StandardScaler()), ("model", Ridge(alpha=1.0))])),
         ("knn",               Pipeline([("scaler", StandardScaler()), ("model", KNeighborsRegressor(n_neighbors=5, n_jobs=-1))])),
@@ -202,7 +341,7 @@ def train_all():
         summary[fname] = mae
         free(model)
 
-    # ── Final summary ──
+    # ── Summary ──────────────────────────────────────────────────────────────
     print("\n" + "=" * 50)
     print(f"{'Model':<25} {'MAE':>8}")
     print("-" * 35)

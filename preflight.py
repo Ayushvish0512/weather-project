@@ -2,7 +2,7 @@
 preflight.py — Hardware & Environment Preflight Check
 
 Run this ONCE before:
-  - Training any model (ml/train_all_fixed.py, ml/train.py)
+  - Training any model (ml/train_all.py, ml/train.py)
   - Downloading data (data/bootstrap.py, data/collect.py)
   - Starting the API server (app/main.py)
 
@@ -288,7 +288,7 @@ def check_ram():
             ok(f"{avail_gb:.1f} GB available  /  {total_gb:.1f} GB total")
         else:
             warn(f"Only {avail_gb:.1f} GB available — training may be slow or crash")
-            info("Close other applications before training, or reduce TREES_TOTAL in train_all_fixed.py")
+            info("Close other applications before training, or reduce TREES_TOTAL in train_all.py")
     except ImportError:
         warn("psutil not installed — cannot check RAM")
         info("Install: pip install psutil  (optional but recommended)")
@@ -329,7 +329,7 @@ def main():
         print("✅  All checks passed — environment is fully ready.\n")
         print("  Next steps:")
         print("    python data/bootstrap.py          # download historical data")
-        print("    python ml/train_all_fixed.py      # train all models")
+        print("    python ml/train_all.py            # train all models")
         print("    python ml/predict.py              # generate prediction")
         sys.exit(0)
 

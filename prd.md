@@ -604,7 +604,7 @@ Yes. Their MAE results are real and meaningful:
 None of these will win against RandomForest or XGBoost on this dataset. That is expected and fine. They exist in the pipeline for two reasons:
 
 1. **Baseline comparison** — they prove the ensemble models are actually earning their complexity. If RandomForest only beat LinearRegression by 0.01°C, it wouldn't be worth the RAM and training time.
-2. **Automatic best-model selection** — `train_all_fixed.py` picks the lowest MAE across all 7 models. If for some reason the ensemble models overfit badly on a future dataset, a simpler model could legitimately win.
+2. **Automatic best-model selection** — `train_all.py` picks the lowest MAE across all 7 models. If for some reason the ensemble models overfit badly on a future dataset, a simpler model could legitimately win.
 
 **Why are they always CPU?**
 

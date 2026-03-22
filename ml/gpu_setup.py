@@ -197,7 +197,7 @@ if __name__ == "__main__":
 
     if status["device"] == "cuda":
         print("\nYour environment is GPU-ready.")
-        print("Run: python ml/train_all_fixed.py")
+        print("Run: python ml/train_all.py")
     else:
         print("\nYour environment is NOT GPU-ready.")
         print("Install the packages above, then re-run: python ml/gpu_setup.py")
