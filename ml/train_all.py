@@ -85,18 +85,16 @@ except ImportError:
 # ── Project root on sys.path so imports work from any working directory ──────
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from ml.preprocess import load_raw_data, get_features_and_target, FEATURE_COLS
-from ml.gpu_setup import validate_gpu, detect_gpu, device_label
+from ml.gpu_setup import detect_gpu, device_label
 
 ROOT       = Path(__file__).resolve().parent.parent
 MODELS_DIR = ROOT / "ml"
 
 # ── Config ───────────────────────────────────────────────────────────────────
-EPOCHS      = 20
-TREES_TOTAL = 100
-CPU_CORES   = os.cpu_count() or 4
-
-# Set True to hard-fail if GPU is not available instead of silently using CPU
-FORCE_GPU   = False
+EPOCHS       = 20
+TREES_TOTAL  = 100
+TORCH_EPOCHS = 300   # epochs for PyTorch MLP — increase for better accuracy (500–1000)
+CPU_CORES    = os.cpu_count() or 4
 
 
 def _latest_csv_date():
@@ -286,7 +284,6 @@ def train_torch_gpu(X_train, y_train, X_test, y_test, name="torch_gpu"):
             optimizer, mode="min", factor=0.5, patience=20
         )
 
-        TORCH_EPOCHS = 300
         net.train()
         for epoch in range(TORCH_EPOCHS):
             optimizer.zero_grad()
@@ -326,9 +323,6 @@ def train_all(only: list[str] | None = None):
               Valid names: random_forest, gradient_boosting, xgboost,
                            torch_gpu, decision_tree, linear_regression, ridge, knn
     """
-    # ── GPU enforcement — runs checks, prints results, fails if FORCE_GPU=True ──
-    validate_gpu(require_gpu=FORCE_GPU)
-
     device = detect_gpu()
     print(f"Device: {device.upper()}  |  CPU cores: {CPU_CORES}")
 
