@@ -11,3 +11,7 @@ xgboost
 statsmodels
 python-dotenv
 python-dateutil
+
+# GPU XGBoost support (for GTX 1650 CUDA 13.1):
+# pip install --upgrade xgboost --extra-index-url https://pypi.ngc.nvidia.com
+# or conda install -c conda-forge py-xgboost-gpu cudatoolkit=12.1
