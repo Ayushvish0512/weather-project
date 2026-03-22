@@ -6,6 +6,7 @@ ml/train_all.py
 - numpy arrays kept as float32 (half the RAM of float64)
 - XGBoost uses hist tree method (low RAM)
 - RF/GB use max_samples + max_features to limit per-tree memory
+- GPU auto-detected: uses CUDA if available, falls back to CPU silently
 """
 import os
 import gc
@@ -19,6 +20,8 @@ from sklearn.linear_model import LinearRegression, Ridge
 from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor
 from sklearn.tree import DecisionTreeRegressor
 from sklearn.neighbors import KNeighborsRegressor
+from sklearn.preprocessing import StandardScaler
+from sklearn.pipeline import Pipeline
 from sklearn.metrics import mean_absolute_error
 from xgboost import XGBRegressor, callback
 
@@ -29,6 +32,24 @@ MODELS_DIR = ROOT / "ml"
 
 EPOCHS      = 10
 TREES_TOTAL = 50
+CPU_CORES   = os.cpu_count() or 4
+
+
+def detect_gpu() -> str:
+    """Return 'cuda' if a CUDA GPU is available, else 'cpu'."""
+    try:
+        import json, warnings
+        _X = np.ones((4, 2), dtype="float32")
+        _y = np.ones(4, dtype="float32")
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            _m = XGBRegressor(device="cuda", n_estimators=1, verbosity=0)
+            _m.fit(_X, _y)
+        cfg = json.loads(_m.get_booster().save_config())
+        device = cfg.get("learner", {}).get("generic_param", {}).get("device", "cpu")
+        return device if device == "cuda" else "cpu"
+    except Exception:
+        return "cpu"
 
 
 def load_data():
@@ -82,8 +103,8 @@ def train_gb(X_train, y_train, X_test, y_test, name="gradient_boosting"):
     return model, mae
 
 
-def train_xgb(X_train, y_train, X_test, y_test, name="xgboost"):
-    print(f"\n  [{name}] {TREES_TOTAL} rounds — printing every {TREES_TOTAL // EPOCHS}")
+def train_xgb(X_train, y_train, X_test, y_test, name="xgboost", device="cpu"):
+    print(f"\n  [{name}] {TREES_TOTAL} rounds — printing every {TREES_TOTAL // EPOCHS}  [device: {device}]")
 
     class EpochPrinter(callback.TrainingCallback):
         def after_iteration(self, model, epoch, evals_log):
@@ -99,11 +120,12 @@ def train_xgb(X_train, y_train, X_test, y_test, name="xgboost"):
         random_state=42,
         verbosity=0,
         eval_metric="mae",
-        tree_method="hist",    # low RAM histogram method
+        tree_method="hist",
+        device=device,
         max_depth=6,
         subsample=0.8,
         colsample_bytree=0.8,
-        nthread=-1,            # use all CPU cores
+        nthread=CPU_CORES,
         callbacks=[EpochPrinter()]
     )
     model.fit(X_train, y_train, eval_set=[(X_test, y_test)], verbose=False)
@@ -123,6 +145,9 @@ def train_simple(name, model, X_train, y_train, X_test, y_test):
 
 
 def train_all():
+    device = detect_gpu()
+    print(f"Device: {device.upper()}  |  CPU cores: {CPU_CORES}")
+
     X, y = load_data()   # already float32, features engineered
     gc.collect()
 
@@ -140,9 +165,9 @@ def train_all():
     # ── Train one model at a time, save immediately, then free RAM ──
 
     for train_fn, fname in [
-        (lambda: train_rf(X_train, y_train, X_test, y_test),  "random_forest"),
-        (lambda: train_gb(X_train, y_train, X_test, y_test),  "gradient_boosting"),
-        (lambda: train_xgb(X_train, y_train, X_test, y_test), "xgboost"),
+        (lambda: train_rf(X_train, y_train, X_test, y_test),                  "random_forest"),
+        (lambda: train_gb(X_train, y_train, X_test, y_test),                  "gradient_boosting"),
+        (lambda: train_xgb(X_train, y_train, X_test, y_test, device=device),  "xgboost"),
     ]:
         model, mae = train_fn()
         joblib.dump(model, MODELS_DIR / f"model_{fname}.pkl")
@@ -151,9 +176,11 @@ def train_all():
 
     for fname, mdl in [
         ("decision_tree",     DecisionTreeRegressor(max_depth=12, random_state=42)),
-        ("linear_regression", LinearRegression()),
-        ("ridge",             Ridge(alpha=1.0)),
-        ("knn",               KNeighborsRegressor(n_neighbors=5, n_jobs=-1)),
+        # Linear models and KNN need feature scaling — wrap in Pipeline to fix
+        # the ill-conditioned matrix warning and improve accuracy
+        ("linear_regression", Pipeline([("scaler", StandardScaler()), ("model", LinearRegression())])),
+        ("ridge",             Pipeline([("scaler", StandardScaler()), ("model", Ridge(alpha=1.0))])),
+        ("knn",               Pipeline([("scaler", StandardScaler()), ("model", KNeighborsRegressor(n_neighbors=5, n_jobs=-1))])),
     ]:
         model, mae = train_simple(fname, mdl, X_train, y_train, X_test, y_test)
         joblib.dump(model, MODELS_DIR / f"model_{fname}.pkl")
