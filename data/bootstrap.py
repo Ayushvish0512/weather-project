@@ -10,8 +10,8 @@ import pandas as pd
 from datetime import date, timedelta
 from dateutil.relativedelta import relativedelta
 
-HISTORY_START = date(2020, 1, 1)   # fixed — never change
-HISTORY_END   = date(2026, 3, 13)  # extend as needed
+HISTORY_START = date(2020, 1, 1)          # fixed — never change
+HISTORY_END   = date.today() - timedelta(days=1)  # always yesterday — auto-updates
 
 BASE_URL = (
     "https://archive-api.open-meteo.com/v1/archive"
@@ -41,6 +41,17 @@ COLUMN_MAP = {
 
 def download_year(start: date, end: date) -> str:
     csv_path = f"data/weather_{start}_{end}.csv"
+
+    # For the current (partial) year, the end date changes daily.
+    # Delete any stale file for the same start date before re-downloading.
+    if not os.path.exists(csv_path):
+        stale = [
+            f for f in os.listdir("data")
+            if f.startswith(f"weather_{start}_") and f.endswith(".csv")
+        ]
+        for s in stale:
+            os.remove(f"data/{s}")
+            print(f"Removed stale file: {s}")
 
     if os.path.exists(csv_path):
         print(f"Already exists, skipping: {csv_path}")

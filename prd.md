@@ -381,18 +381,121 @@ Location is fixed to Gurgaon, India (lat 28.4595, lon 77.0266).
 
 ### Bootstrap Logic
 
-`data/bootstrap.py` downloads in yearly chunks and skips files that already exist:
-
-| Scenario | Behaviour |
-|---|---|
-| `data/` folder empty | Downloads from `HISTORY_START` (2020-01-01) to `HISTORY_END` |
-| CSV exists but behind | Skips existing files, downloads only missing years |
-| CSV is current | Skips — nothing to do |
+`data/bootstrap.py` downloads in yearly chunks. `HISTORY_END` is always computed at runtime as yesterday — no manual edits ever needed.
 
 ```python
-HISTORY_START = date(2020, 1, 1)   # NEVER change — fixed baseline
-HISTORY_END   = date(2026, 3, 13)  # extend forward as needed
+HISTORY_START = date(2020, 1, 1)                    # NEVER change — fixed baseline
+HISTORY_END   = date.today() - timedelta(days=1)    # always yesterday, auto-updates
 ```
+
+The download range is split into yearly chunks:
+
+```
+2020-01-01 → 2020-12-31   (full year)
+2021-01-01 → 2021-12-31   (full year)
+...
+2026-01-01 → 2026-03-21   (partial — current year, end = yesterday)
+```
+
+---
+
+### File Naming Convention
+
+Each chunk is saved as:
+
+```
+data/weather_{chunk_start}_{chunk_end}.csv
+```
+
+Examples:
+```
+data/weather_2020-01-01_2020-12-31.csv   ← full year, never changes
+data/weather_2021-01-01_2021-12-31.csv   ← full year, never changes
+data/weather_2026-01-01_2026-03-21.csv   ← partial year, end date moves daily
+```
+
+The current year's file has a moving end date in its filename. Every day you run bootstrap, yesterday becomes the new end date, so the filename changes.
+
+---
+
+### Skip vs Re-download Decision Logic
+
+For each chunk, `download_year(start, end)` runs this logic:
+
+```
+Step 1 — Build expected filename:
+    csv_path = f"data/weather_{start}_{end}.csv"
+
+Step 2 — Check for stale file (same start, different end date):
+    stale = any file matching "weather_{start}_*.csv" that is NOT csv_path
+    → If found: DELETE the stale file, then proceed to download
+
+Step 3 — Check if current file already exists:
+    → If csv_path exists: SKIP (already up to date)
+    → If not: DOWNLOAD from Open-Meteo API
+```
+
+---
+
+### Scenario Walkthrough
+
+**Scenario A — First run ever (empty `data/` folder)**
+```
+No files exist → all chunks download from scratch
+2020-01-01_2020-12-31.csv  ← downloaded
+2021-01-01_2021-12-31.csv  ← downloaded
+...
+2026-01-01_2026-03-21.csv  ← downloaded (partial year, ends yesterday)
+```
+
+**Scenario B — Re-run same day**
+```
+All files exist with correct end dates → all skipped
+Already exists, skipping: weather_2020-01-01_2020-12-31.csv
+Already exists, skipping: weather_2026-01-01_2026-03-21.csv
+```
+
+**Scenario C — Re-run next day (most important case)**
+```
+Full year files (2020–2025) → unchanged filenames → skipped
+Current year file:
+  Stale:    weather_2026-01-01_2026-03-21.csv  ← DELETED
+  Expected: weather_2026-01-01_2026-03-22.csv  ← DOWNLOADED (new end date)
+```
+
+**Scenario D — Re-run after a week away**
+```
+Full year files → skipped
+Current year file:
+  Stale:    weather_2026-01-01_2026-03-21.csv  ← DELETED
+  Expected: weather_2026-01-01_2026-03-28.csv  ← DOWNLOADED (catches up all missing days)
+```
+
+**Scenario E — New year rolls over (Jan 1)**
+```
+2025-01-01_2025-12-31.csv  ← now a complete year, never changes again
+2026-01-01_2026-01-01.csv  ← new partial year file created (just 1 day)
+```
+
+---
+
+### Why "yesterday" and not "today"
+
+Open-Meteo archive API has a ~1 day lag. Today's data is not yet available or is incomplete. Using `date.today() - timedelta(days=1)` ensures every request returns complete hourly data for all 24 hours of the requested end date.
+
+Requesting today would return partial data (only hours up to the current UTC time), which would create NaN rows in the CSV and corrupt lag features during training.
+
+---
+
+### Summary Table
+
+| Scenario | Full year files (2020–2025) | Current year file |
+|---|---|---|
+| First run | Downloaded | Downloaded |
+| Same day re-run | Skipped | Skipped |
+| Next day re-run | Skipped | Stale deleted → re-downloaded |
+| After N days away | Skipped | Stale deleted → re-downloaded (catches up) |
+| New year (Jan 1) | Previous year now complete, skipped forever | New partial file created |
 
 ---
 
