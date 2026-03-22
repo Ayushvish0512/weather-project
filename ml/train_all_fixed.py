@@ -91,19 +91,70 @@ CPU_CORES   = os.cpu_count() or 4
 FORCE_GPU   = False
 
 
-def load_data():
-    """Load CSVs, auto-bootstrap if missing."""
-    if not list((ROOT / "data").glob("weather_*.csv")):
-        print("No CSV files found in data/. Running bootstrap to download data...")
-        import subprocess
-        result = subprocess.run(
-            [sys.executable, str(ROOT / "data" / "bootstrap.py")],
-            cwd=str(ROOT)
-        )
-        if result.returncode != 0:
-            raise RuntimeError("Bootstrap failed. Check your internet connection and try running data/bootstrap.py manually.")
-        print("Bootstrap complete. Continuing with training...\n")
+def _latest_csv_date() -> date:
+    """Return the latest recorded_at date found across all CSVs (fast — reads last row only)."""
+    import pandas as pd
+    from datetime import date as date_type
+    csvs = sorted((ROOT / "data").glob("weather_*.csv"))
+    if not csvs:
+        return None
+    # Read only the last row of the last (most recent) file
+    last_file = csvs[-1]
+    df_tail = pd.read_csv(last_file, usecols=["recorded_at"]).tail(1)
+    if df_tail.empty:
+        return None
+    return pd.to_datetime(df_tail["recorded_at"].iloc[0]).date()
 
+
+def _check_data_freshness():
+    """
+    Check if CSVs contain data up to yesterday (D-1).
+    Prompts the user: Y = run bootstrap first, N = train on existing data.
+    """
+    from datetime import date, timedelta
+    yesterday = date.today() - timedelta(days=1)
+    latest    = _latest_csv_date()
+
+    if latest is None:
+        # No CSVs at all — must bootstrap
+        print("No CSV files found in data/. Running bootstrap to download data...")
+        _run_bootstrap()
+        return
+
+    gap_days = (yesterday - latest).days
+
+    if gap_days <= 0:
+        print(f"✅ Data is up to date — latest row: {latest}  (yesterday: {yesterday})")
+        return
+
+    # Data is behind
+    print(f"\n⚠️  Data is {gap_days} day(s) behind.")
+    print(f"   Latest row in CSVs : {latest}")
+    print(f"   Yesterday (D-1)    : {yesterday}")
+    print(f"   Missing            : {gap_days} day(s) of hourly data\n")
+
+    answer = input("Download missing data before training? [Y/n]: ").strip().lower()
+    if answer in ("", "y", "yes"):
+        _run_bootstrap()
+    else:
+        print(f"Proceeding with existing data (up to {latest}). Training may miss recent patterns.\n")
+
+
+def _run_bootstrap():
+    import subprocess
+    print("Running data/bootstrap.py ...\n")
+    result = subprocess.run(
+        [sys.executable, str(ROOT / "data" / "bootstrap.py")],
+        cwd=str(ROOT)
+    )
+    if result.returncode != 0:
+        raise RuntimeError("Bootstrap failed. Run data/bootstrap.py manually to debug.")
+    print("Bootstrap complete. Continuing with training...\n")
+
+
+def load_data():
+    """Check data freshness, optionally sync, then load all CSVs."""
+    _check_data_freshness()
     df = load_raw_data()
     X, y = get_features_and_target(df)
     return X, y
