@@ -1,0 +1,23 @@
+# ── Render production requirements ───────────────────────────────────────────
+# Minimal install for FastAPI inference only.
+# No training libs (scikit-learn, xgboost, torch, statsmodels) — not needed on Render.
+# Model is pre-trained locally and committed as ml/model.pkl.
+
+# API server
+fastapi
+uvicorn
+
+# Model loading + feature engineering
+joblib
+numpy
+pandas
+
+# Database
+psycopg2-binary
+python-dotenv
+
+# Webhook HTTP client
+httpx
+
+# FastAPI request body validation (usually bundled with fastapi but explicit is safer)
+pydantic

@@ -75,7 +75,7 @@ git push
 | Region | Singapore or closest to India |
 | Branch | `main` |
 | Runtime | Python 3 |
-| Build Command | `pip install -r requirements.txt` |
+| Build Command | `pip install -r render_requirements.txt` |
 | Start Command | `uvicorn app.main:app --host 0.0.0.0 --port $PORT` |
 
 > Do NOT use `--reload` on Render — that's for local dev only. Render sets `$PORT` automatically.
