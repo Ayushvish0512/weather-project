@@ -29,18 +29,69 @@ def load_model():
         return None
 
 
-def get_latest_features() -> tuple[np.ndarray, dict]:
-    """Load last 30 rows, engineer all 24 features, return (feature_array, last_raw_row)."""
-    files = sorted(glob.glob(DATA_GLOB))
-    if not files:
-        raise HTTPException(status_code=503, detail="No CSV data. Run data/bootstrap.py first.")
-    df = pd.read_csv(files[-1]).tail(30).copy()
+def _fetch_live_data() -> pd.DataFrame:
+    """
+    Fetch last 30 hours of weather data directly from Open-Meteo archive API.
+    Used on Render where no CSV files are present.
+    Returns a DataFrame with the same columns as the CSV files.
+    """
+    import requests
+    end   = datetime.utcnow().date()
+    start = end - timedelta(days=3)   # 3 days back — enough for lag_24h + rolling_6h
+
+    url = (
+        "https://archive-api.open-meteo.com/v1/archive"
+        "?latitude=28.4595&longitude=77.0266"
+        f"&start_date={start}&end_date={end}"
+        "&hourly=temperature_2m,apparent_temperature,relative_humidity_2m,"
+        "dew_point_2m,pressure_msl,cloudcover,visibility,windspeed_10m,"
+        "winddirection_10m,windgusts_10m,precipitation,rain,weathercode"
+    )
+    resp = requests.get(url, timeout=15)
+    resp.raise_for_status()
+
+    hourly = resp.json()["hourly"]
+    df = pd.DataFrame(hourly).rename(columns={
+        "time":                  "recorded_at",
+        "temperature_2m":        "temperature",
+        "apparent_temperature":  "feels_like",
+        "relative_humidity_2m":  "humidity",
+        "dew_point_2m":          "dew_point",
+        "pressure_msl":          "pressure",
+        "windspeed_10m":         "wind_speed",
+        "winddirection_10m":     "wind_direction",
+        "windgusts_10m":         "wind_gusts",
+        "weathercode":           "weather_main",
+    })
     df["recorded_at"] = pd.to_datetime(df["recorded_at"])
-    df = df.sort_values("recorded_at").reset_index(drop=True)
+    return df.tail(30).reset_index(drop=True)
+
+
+def get_latest_features() -> tuple[np.ndarray, dict]:
+    """
+    Load last 30 rows and engineer all 24 features.
+    Source priority:
+      1. Local CSV files (local dev / if CSVs committed)
+      2. Live Open-Meteo API fetch (Render — no CSVs)
+    """
+    files = sorted(glob.glob(DATA_GLOB))
+
+    if files:
+        df = pd.read_csv(files[-1]).tail(30).copy()
+        df["recorded_at"] = pd.to_datetime(df["recorded_at"])
+        df = df.sort_values("recorded_at").reset_index(drop=True)
+    else:
+        # No CSVs — fetch live from Open-Meteo (Render environment)
+        try:
+            df = _fetch_live_data()
+        except Exception as e:
+            raise HTTPException(status_code=503, detail=f"No CSV data and live fetch failed: {e}")
+
     df = engineer_features(df)
     df.dropna(subset=FEATURE_COLS, inplace=True)
     if df.empty:
         raise HTTPException(status_code=503, detail="Not enough rows to compute lag features.")
+
     last = df.iloc[-1]
     raw = {
         "cloudcover": float(last.get("cloudcover", 0)),

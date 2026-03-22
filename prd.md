@@ -313,7 +313,7 @@ FastAPI + Webhook  →  n8n / external consumers
 ```
 bootstrap.py  → downloads CSVs only (no DB write — training data stays in CSV)
 train_all.py  → merges all CSVs → engineers 24 features → trains 7 models → saves .pkl
-predict.py    → loads model.pkl → engineers features from last 30 CSV rows → predicts → saves to DB
+predict.py    → loads model.pkl → engineers features from last 30 rows (CSV or live API) → predicts → saves to DB
 evaluate.py   → JOINs weather_predictions vs weather_raw → computes MAE/RMSE → saves to DB
 ```
 
@@ -1017,11 +1017,38 @@ Known challenges, limitations, and technical debt in this project. Grouped by ca
 
 ### 3. Prediction Quality
 
+**How `get_latest_features()` sources its data**
+
+At prediction time the API needs the last 30 hours of real weather to compute lag and rolling features. It uses a two-source fallback:
+
+```
+1. Local CSV files present?
+   → YES: read last 30 rows from the most recent weather_*.csv
+   → NO:  fetch last 3 days from Open-Meteo archive API (live call)
+```
+
+This means:
+- Local dev: uses CSV files (fast, no network call)
+- Render (no CSVs committed): automatically calls Open-Meteo API on every prediction request
+
+The live fetch hits `archive-api.open-meteo.com` with a 3-day window ending today, takes the last 30 rows, and engineers the same 24 features as training. The model receives identical feature structure regardless of source.
+
+Why this is not biased — the model does not return the input temperature. It receives 24 features (lag values, rolling stats, time, humidity, pressure, etc.) and outputs a new number — the predicted temperature for the next hour. The lag features inform the direction of change, not the output value directly.
+
+How to verify it's not just echoing the current temperature:
+```
+Call /predict/next-hour at 14:35 → returns prediction for 15:00
+Call /predict/next-hour at 15:35 → returns prediction for 16:00
+```
+If the two predictions differ (they will, because lag features updated), the model is working correctly.
+
+---
+
 **Multi-hour forecast uses stale lag features**
 
 - Root cause: `/predict/hours?hours=6` calls `get_latest_features()` once and reuses the same feature vector for all 6 hours. The lag features (`temp_lag_1h`, `temp_lag_3h`, `temp_rolling_mean_6h`) are computed from the last real CSV row — they don't update as the forecast rolls forward.
 - Impact: Hour 1 prediction is accurate. Hours 2–6 are essentially the same prediction repeated with only the `hour` field changing. The further ahead, the less meaningful the result.
-- Fix: Implement autoregressive forecasting — feed each prediction back as the next hour's lag:
+- Fix (pending): Implement autoregressive forecasting — feed each prediction back as the next hour's lag:
   ```python
   predicted_temps = []
   lag_window = list(df["temperature"].tail(24))  # seed with real data
@@ -1033,7 +1060,7 @@ Known challenges, limitations, and technical debt in this project. Grouped by ca
       lag_window.append(temp)   # use prediction as next lag input
       lag_window.pop(0)
   ```
-- Status: not fixed — all forecast hours use identical lag features
+- Status: ⏳ PENDING — identified, fix designed, not yet implemented. Hour 1 predictions are accurate. Multi-hour forecasts (hours 2+) are unreliable until this is done.
 
 ---
 
