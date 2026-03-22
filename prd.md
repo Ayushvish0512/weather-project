@@ -77,6 +77,36 @@ Trains RandomForest on all CSVs, saves `ml/model.pkl` and `ml/model_v1.pkl`.
 
 Trains 7 algorithms with epoch-style progress printed to terminal. Saves each `.pkl` file, then auto-sets the best performer as `model.pkl`.
 
+#### Train specific models only (optional)
+
+You can pass one or more model names as arguments to skip the rest:
+
+```powershell
+# Train only the PyTorch GPU model
+.\venv\Scripts\python.exe ml/train_all.py torch_gpu
+
+# Train two models and pick the best between them
+.\venv\Scripts\python.exe ml/train_all.py random_forest xgboost
+
+# Train all (default — no arguments)
+.\venv\Scripts\python.exe ml/train_all.py
+```
+
+Valid model names:
+
+| Name | Type |
+|---|---|
+| `random_forest` | Ensemble — CPU |
+| `gradient_boosting` | Ensemble — CPU |
+| `xgboost` | Gradient boosting — GPU if available |
+| `torch_gpu` | PyTorch MLP — GPU if available |
+| `decision_tree` | Single tree — CPU |
+| `linear_regression` | Linear — CPU |
+| `ridge` | Regularised linear — CPU |
+| `knn` | Instance-based — CPU |
+
+When training a subset, `model.pkl` is still updated to the best of whichever models were trained in that run. If you want to keep the existing `model.pkl` untouched, don't run `train_all.py` — just use the individual `model_*.pkl` files directly.
+
 **What you'll see in the terminal:**
 
 ```

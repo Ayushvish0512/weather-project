@@ -283,7 +283,7 @@ def train_torch_gpu(X_train, y_train, X_test, y_test, name="torch_gpu"):
         optimizer = torch.optim.Adam(net.parameters(), lr=3e-3, weight_decay=1e-4)
         # Reduce LR by 0.5 if loss doesn't improve for 20 epochs
         scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-            optimizer, mode="min", factor=0.5, patience=20, verbose=False
+            optimizer, mode="min", factor=0.5, patience=20
         )
 
         TORCH_EPOCHS = 300
@@ -317,7 +317,15 @@ def train_torch_gpu(X_train, y_train, X_test, y_test, name="torch_gpu"):
         print(f"\n  [{name}] failed: {e}")
         return None, float("inf")
 
-def train_all():
+def train_all(only: list[str] | None = None):
+    """
+    Train models and save the best as model.pkl.
+
+    Args:
+        only: list of model names to train. None = train all.
+              Valid names: random_forest, gradient_boosting, xgboost,
+                           torch_gpu, decision_tree, linear_regression, ridge, knn
+    """
     # ── GPU enforcement — runs checks, prints results, fails if FORCE_GPU=True ──
     validate_gpu(require_gpu=FORCE_GPU)
 
@@ -334,34 +342,46 @@ def train_all():
 
     print(f"Dataset: {len(X_train)} train / {len(X_test)} test rows")
     print(f"Epochs: {EPOCHS}  |  Total trees: {TREES_TOTAL}")
+    if only:
+        print(f"Training only: {', '.join(only)}")
     print("=" * 50)
 
     summary = {}
 
-    # GPU-capable models
-    for train_fn, fname in [
+    all_iterative = [
         (lambda: train_rf(X_train, y_train, X_test, y_test),                 "random_forest"),
         (lambda: train_gb(X_train, y_train, X_test, y_test),                 "gradient_boosting"),
         (lambda: train_xgb(X_train, y_train, X_test, y_test, device=device), "xgboost"),
         (lambda: train_torch_gpu(X_train, y_train, X_test, y_test),          "torch_gpu"),
-    ]:
+    ]
+
+    all_simple = [
+        ("decision_tree",     DecisionTreeRegressor(max_depth=12, random_state=42)),
+        ("linear_regression", Pipeline([("scaler", StandardScaler()), ("model", LinearRegression())])),
+        ("ridge",             Pipeline([("scaler", StandardScaler()), ("model", Ridge(alpha=1.0))])),
+        ("knn",               Pipeline([("scaler", StandardScaler()), ("model", KNeighborsRegressor(n_neighbors=5, n_jobs=-1))])),
+    ]
+
+    for train_fn, fname in all_iterative:
+        if only and fname not in only:
+            continue
         model, mae = train_fn()
         if model is not None:
             joblib.dump(model, MODELS_DIR / f"model_{fname}.pkl")
             summary[fname] = mae
             free(model)
 
-    # CPU-only sklearn models
-    for fname, mdl in [
-        ("decision_tree",     DecisionTreeRegressor(max_depth=12, random_state=42)),
-        ("linear_regression", Pipeline([("scaler", StandardScaler()), ("model", LinearRegression())])),
-        ("ridge",             Pipeline([("scaler", StandardScaler()), ("model", Ridge(alpha=1.0))])),
-        ("knn",               Pipeline([("scaler", StandardScaler()), ("model", KNeighborsRegressor(n_neighbors=5, n_jobs=-1))])),
-    ]:
+    for fname, mdl in all_simple:
+        if only and fname not in only:
+            continue
         model, mae = train_simple(fname, mdl, X_train, y_train, X_test, y_test)
         joblib.dump(model, MODELS_DIR / f"model_{fname}.pkl")
         summary[fname] = mae
         free(model)
+
+    if not summary:
+        print("\nNo models trained. Check the model names passed via CLI.")
+        return
 
     # ── Summary ──────────────────────────────────────────────────────────────
     print("\n" + "=" * 50)
@@ -378,4 +398,33 @@ def train_all():
 
 
 if __name__ == "__main__":
-    train_all()
+    import argparse
+
+    VALID = {"random_forest", "gradient_boosting", "xgboost", "torch_gpu",
+             "decision_tree", "linear_regression", "ridge", "knn"}
+
+    parser = argparse.ArgumentParser(
+        description="Train weather ML models.",
+        epilog=(
+            "Examples:\n"
+            "  python ml/train_all.py                          # train all\n"
+            "  python ml/train_all.py torch_gpu                # one model\n"
+            "  python ml/train_all.py random_forest xgboost    # multiple\n"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument(
+        "models", nargs="*",
+        help=f"Model(s) to train. Valid: {', '.join(sorted(VALID))}. Omit to train all."
+    )
+    args = parser.parse_args()
+
+    if args.models:
+        invalid = set(args.models) - VALID
+        if invalid:
+            print(f"Unknown model(s): {', '.join(invalid)}")
+            print(f"Valid options: {', '.join(sorted(VALID))}")
+            sys.exit(1)
+        train_all(only=args.models)
+    else:
+        train_all()
