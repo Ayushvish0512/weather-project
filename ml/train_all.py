@@ -56,6 +56,18 @@ def detect_gpu() -> str:
 
 
 def load_data():
+    # Auto-download data if CSVs are missing
+    if not list((ROOT / "data").glob("weather_*.csv")):
+        print("No CSV files found in data/. Running bootstrap to download data...")
+        import subprocess
+        result = subprocess.run(
+            [sys.executable, str(ROOT / "data" / "bootstrap.py")],
+            cwd=str(ROOT)
+        )
+        if result.returncode != 0:
+            raise RuntimeError("Bootstrap failed. Check your internet connection and try running data/bootstrap.py manually.")
+        print("Bootstrap complete. Continuing with training...\n")
+
     df = load_raw_data()
     X, y = get_features_and_target(df)
     return X, y
