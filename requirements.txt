@@ -1,17 +1,48 @@
+# ── Core API & utilities ──────────────────────────────────────────────────────
 fastapi
 uvicorn
 httpx
 psycopg2-binary
 requests
-pandas
-scikit-learn
-joblib
-numpy
-xgboost
-statsmodels
 python-dotenv
 python-dateutil
 
-# GPU XGBoost support (for GTX 1650 CUDA 13.1):
-# pip install --upgrade xgboost --extra-index-url https://pypi.ngc.nvidia.com
-# or conda install -c conda-forge py-xgboost-gpu cudatoolkit=12.1
+# ── Data & ML ─────────────────────────────────────────────────────────────────
+pandas
+numpy
+scikit-learn
+joblib
+statsmodels
+
+# ── XGBoost ───────────────────────────────────────────────────────────────────
+# Plain install — CPU only. For GPU (GTX 1650 / CUDA), see install notes below.
+xgboost
+
+# ── Optional: RAM monitoring (used by preflight.py) ──────────────────────────
+psutil
+
+# =============================================================================
+# GPU SETUP — run these manually in order, DO NOT add torch to this file.
+# pip resolves torch from a separate index and will break on plain pip install -r
+# =============================================================================
+#
+# Step 1 — Uninstall CPU xgboost first:
+#   .\venv\Scripts\pip uninstall xgboost -y
+#
+# Step 2 — Install PyTorch with CUDA 12.1 (GTX 1650 compatible):
+#   .\venv\Scripts\pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
+#
+# Step 3 — Install XGBoost GPU build:
+#   .\venv\Scripts\pip install xgboost==2.0.3
+#
+#   If xgboost==2.0.3 fails (Python 3.13+ not supported):
+#   .\venv\Scripts\pip install xgboost --upgrade --extra-index-url https://pypi.ngc.nvidia.com
+#
+# Step 4 — Verify everything:
+#   .\venv\Scripts\python.exe preflight.py
+#
+# =============================================================================
+# NOTE: torch is intentionally NOT listed here.
+# Adding --index-url inside requirements.txt breaks standard pip install -r.
+# Always install torch manually using the command in Step 2 above.
+# =============================================================================
