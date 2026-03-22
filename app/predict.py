@@ -35,7 +35,7 @@ def _fetch_live_data() -> pd.DataFrame:
     Used on Render where no CSV files are present.
     Returns a DataFrame with the same columns as the CSV files.
     """
-    import requests
+    import httpx
     end   = datetime.utcnow().date()
     start = end - timedelta(days=3)   # 3 days back — enough for lag_24h + rolling_6h
 
@@ -47,7 +47,7 @@ def _fetch_live_data() -> pd.DataFrame:
         "dew_point_2m,pressure_msl,cloudcover,visibility,windspeed_10m,"
         "winddirection_10m,windgusts_10m,precipitation,rain,weathercode"
     )
-    resp = requests.get(url, timeout=15)
+    resp = httpx.get(url, timeout=15)
     resp.raise_for_status()
 
     hourly = resp.json()["hourly"]

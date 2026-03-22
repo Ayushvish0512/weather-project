@@ -11,6 +11,7 @@ uvicorn
 joblib
 numpy
 pandas
+scikit-learn
 
 # Database
 psycopg2-binary
