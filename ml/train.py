@@ -6,8 +6,11 @@ import os
 import gc
 import joblib
 from pathlib import Path
+import sys
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.metrics import mean_absolute_error
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from ml.preprocess import load_raw_data, get_features_and_target
 
 ROOT          = Path(__file__).resolve().parent.parent

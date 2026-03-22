@@ -25,6 +25,9 @@ from sklearn.pipeline import Pipeline
 from sklearn.metrics import mean_absolute_error
 from xgboost import XGBRegressor, callback
 
+# Ensure project root is on sys.path so ml.preprocess resolves
+# regardless of working directory or how the script is invoked
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from ml.preprocess import load_raw_data, engineer_features, get_features_and_target, FEATURE_COLS
 
 ROOT       = Path(__file__).resolve().parent.parent
