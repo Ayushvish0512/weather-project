@@ -564,6 +564,58 @@ y = temperature (°C) at the next hour
 | Ridge | Regularized linear | Single pass — no epochs |
 | KNN | Instance-based | Single pass — no epochs |
 
+---
+
+### Single-Pass Models — Why No Epochs, Are They Working?
+
+The four models that print `single pass (no epochs)` are not broken or undertrained. This is exactly how they are supposed to work.
+
+```
+[decision_tree]      MAE: 0.2504°C   single pass
+[linear_regression]  MAE: 0.3381°C   single pass
+[ridge]              MAE: 0.2856°C   single pass
+[knn]                MAE: 0.6482°C   single pass
+```
+
+**Why single pass?**
+
+These are not iterative learners. They have no concept of "train a little, then train more." Each one solves its problem in a single mathematical operation over the full dataset:
+
+| Model | What happens in one pass |
+|---|---|
+| DecisionTree | Recursively splits the data by the best feature threshold until `max_depth=12` is reached. Done. |
+| LinearRegression | Solves a system of equations (ordinary least squares) — one matrix operation. Done. |
+| Ridge | Same as LinearRegression but adds an L2 penalty term to prevent overfitting. One solve. Done. |
+| KNN | Does nothing during training — just stores the data. Prediction time: finds the 5 nearest neighbours. |
+
+Running them for multiple epochs would not improve them — it would just repeat the same computation and return the same result every time.
+
+**Are they doing their job?**
+
+Yes. Their MAE results are real and meaningful:
+
+| Model | MAE | Verdict |
+|---|---|---|
+| decision_tree | 0.2504°C | Decent — single tree captures non-linear patterns but overfits more than ensembles |
+| linear_regression | 0.3381°C | Expected — temperature is non-linear, linear models hit a ceiling |
+| ridge | 0.2856°C | Slightly better than linear — L2 regularisation reduces variance |
+| knn | 0.6482°C | Worst — KNN struggles with 24 features (curse of dimensionality) and 227k rows |
+
+None of these will win against RandomForest or XGBoost on this dataset. That is expected and fine. They exist in the pipeline for two reasons:
+
+1. **Baseline comparison** — they prove the ensemble models are actually earning their complexity. If RandomForest only beat LinearRegression by 0.01°C, it wouldn't be worth the RAM and training time.
+2. **Automatic best-model selection** — `train_all_fixed.py` picks the lowest MAE across all 7 models. If for some reason the ensemble models overfit badly on a future dataset, a simpler model could legitimately win.
+
+**Why are they always CPU?**
+
+sklearn does not support GPU acceleration. This is a library design decision — sklearn is optimised for CPU parallelism via `n_jobs=-1`. There is no CUDA path, no workaround, and no version of sklearn that changes this. GPU support for these model types would require switching to cuML (NVIDIA RAPIDS), which has significant installation complexity and is not worth it for models that are already fast on CPU at this data size.
+
+**Should you remove them?**
+
+No. They train in under 1 second each, cost almost no RAM, and give you a meaningful baseline. Removing them would only save ~3 seconds of total training time while losing the comparison value.
+
+---
+
 ### Epochs vs n_estimators — Important Distinction
 
 This project uses tree-based models, not neural networks. There are no traditional epochs.
