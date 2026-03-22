@@ -32,6 +32,48 @@ from sklearn.metrics import mean_absolute_error
 from xgboost import XGBRegressor, callback
 import time
 
+# ── PyTorch MLP — defined at module level so joblib/pickle can serialize it ──
+# (classes defined inside functions cannot be pickled — Python limitation)
+try:
+    import torch
+    import torch.nn as nn
+
+    class MLP(nn.Module):
+        """Simple feedforward network for tabular regression."""
+        def __init__(self, n_features: int):
+            super().__init__()
+            self.layers = nn.Sequential(
+                nn.Linear(n_features, 128), nn.ReLU(), nn.Dropout(0.2),
+                nn.Linear(128, 64),         nn.ReLU(), nn.Dropout(0.2),
+                nn.Linear(64, 1)
+            )
+        def forward(self, x):
+            return self.layers(x)
+
+    class TorchRegressorWrapper:
+        """
+        Wraps a trained MLP + its StandardScaler into a sklearn-compatible
+        interface so it can be saved with joblib and used by ml/predict.py
+        via model.predict(X).
+        """
+        def __init__(self, model: MLP, scaler: StandardScaler):
+            self.model  = model
+            self.scaler = scaler
+
+        def predict(self, X: np.ndarray) -> np.ndarray:
+            import torch
+            self.model.eval()
+            Xs = self.scaler.transform(X)
+            t  = torch.tensor(Xs, dtype=torch.float32)
+            with torch.no_grad():
+                out = self.model(t).squeeze(1).numpy()
+            return out
+
+    _TORCH_AVAILABLE = True
+
+except ImportError:
+    _TORCH_AVAILABLE = False
+
 # ── Project root on sys.path so imports work from any working directory ──────
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from ml.preprocess import load_raw_data, get_features_and_target, FEATURE_COLS
@@ -156,61 +198,48 @@ def train_simple(name, model, X_train, y_train, X_test, y_test):
 
 
 def train_torch_gpu(X_train, y_train, X_test, y_test, name="torch_gpu"):
+    if not _TORCH_AVAILABLE:
+        print(f"\n  [{name}] skipped — PyTorch not installed")
+        print("    Install: pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121")
+        return None, float("inf")
+
     try:
         import torch
-        import torch.nn as nn
-        import torch.optim as optim
 
-        scaler = StandardScaler()
+        scaler    = StandardScaler()
         X_train_s = scaler.fit_transform(X_train)
         X_test_s  = scaler.transform(X_test)
-
-        X_train_t = torch.tensor(X_train_s, dtype=torch.float32)
-        X_test_t  = torch.tensor(X_test_s,  dtype=torch.float32)
-        y_train_t = torch.tensor(y_train,   dtype=torch.float32).unsqueeze(1)
-        y_test_t  = torch.tensor(y_test,    dtype=torch.float32).unsqueeze(1)
 
         dev = "cuda" if torch.cuda.is_available() else "cpu"
         print(f"\n  [{name}] {device_label(name, dev)}")
 
-        X_train_t = X_train_t.to(dev)
-        X_test_t  = X_test_t.to(dev)
-        y_train_t = y_train_t.to(dev)
+        X_train_t = torch.tensor(X_train_s, dtype=torch.float32).to(dev)
+        X_test_t  = torch.tensor(X_test_s,  dtype=torch.float32).to(dev)
+        y_train_t = torch.tensor(y_train,   dtype=torch.float32).unsqueeze(1).to(dev)
+        y_test_t  = torch.tensor(y_test,    dtype=torch.float32).unsqueeze(1)
 
-        class MLP(nn.Module):
-            def __init__(self):
-                super().__init__()
-                self.layers = nn.Sequential(
-                    nn.Linear(X_train_t.shape[1], 128), nn.ReLU(), nn.Dropout(0.2),
-                    nn.Linear(128, 64),                 nn.ReLU(), nn.Dropout(0.2),
-                    nn.Linear(64, 1)
-                )
-            def forward(self, x):
-                return self.layers(x)
+        net       = MLP(n_features=X_train_t.shape[1]).to(dev)
+        criterion = torch.nn.MSELoss()
+        optimizer = torch.optim.Adam(net.parameters(), lr=0.001)
 
-        model = MLP().to(dev)
-        criterion = nn.MSELoss()
-        optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
-
-        model.train()
+        net.train()
         for epoch in range(100):
             optimizer.zero_grad()
-            loss = criterion(model(X_train_t), y_train_t)
+            loss = criterion(net(X_train_t), y_train_t)
             loss.backward()
             optimizer.step()
             if epoch % 20 == 0:
                 print(f"    Epoch {epoch:>3}  loss: {loss.item():.4f}")
 
-        model.eval()
+        net.eval()
         with torch.no_grad():
-            mae = torch.mean(torch.abs(model(X_test_t).cpu() - y_test_t.cpu())).item()
+            mae = torch.mean(torch.abs(net(X_test_t).cpu() - y_test_t)).item()
         print(f"    MAE: {mae:.4f}°C")
-        return model.cpu(), mae
 
-    except ImportError:
-        print(f"\n  [{name}] skipped — PyTorch not installed")
-        print("    Install: pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121")
-        return None, float("inf")
+        # Wrap with scaler so predict(X) works identically to sklearn models
+        wrapper = TorchRegressorWrapper(model=net.cpu(), scaler=scaler)
+        return wrapper, mae
+
     except Exception as e:
         print(f"\n  [{name}] failed: {e}")
         return None, float("inf")
