@@ -1,5 +1,10 @@
 .env
 __pycache__/
-*.pkl
 *.pyc
 .venv/
+venv/
+
+# Only model.pkl (the winner) is committed — Render needs it for predictions
+# All per-algorithm files are local only
+ml/*.pkl
+!ml/model.pkl
