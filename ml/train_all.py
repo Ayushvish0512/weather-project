@@ -58,13 +58,15 @@ try:
 
     class TorchRegressorWrapper:
         """
-        Wraps a trained MLP + its StandardScaler into a sklearn-compatible
-        interface so it can be saved with joblib and used by ml/predict.py
-        via model.predict(X).
+        Wraps a trained MLP + scalers into a sklearn-compatible predict(X) interface.
+        Handles both X feature scaling and y target un-scaling so output is always °C.
         """
-        def __init__(self, model: MLP, scaler: StandardScaler):
+        def __init__(self, model: MLP, scaler: StandardScaler,
+                     y_mean: float = 0.0, y_std: float = 1.0):
             self.model  = model
             self.scaler = scaler
+            self.y_mean = y_mean
+            self.y_std  = y_std
 
         def predict(self, X: np.ndarray) -> np.ndarray:
             import torch
@@ -72,8 +74,8 @@ try:
             Xs = self.scaler.transform(X)
             t  = torch.tensor(Xs, dtype=torch.float32)
             with torch.no_grad():
-                out = self.model(t).squeeze(1).numpy()
-            return out
+                pred_scaled = self.model(t).squeeze(1).numpy()
+            return pred_scaled * self.y_std + self.y_mean  # un-scale to °C
 
     _TORCH_AVAILABLE = True
 
@@ -257,38 +259,58 @@ def train_torch_gpu(X_train, y_train, X_test, y_test, name="torch_gpu"):
     try:
         import torch
 
-        scaler    = StandardScaler()
-        X_train_s = scaler.fit_transform(X_train)
-        X_test_s  = scaler.transform(X_test)
+        # Scale both features AND target — critical for MLP convergence
+        # Without target scaling, MSELoss operates on raw °C values (~30²=900)
+        # causing exploding gradients and slow convergence
+        X_scaler = StandardScaler()
+        y_mean   = float(y_train.mean())
+        y_std    = float(y_train.std()) or 1.0
+
+        X_train_s = X_scaler.fit_transform(X_train)
+        X_test_s  = X_scaler.transform(X_test)
+        y_train_s = (y_train - y_mean) / y_std   # normalise target to ~N(0,1)
 
         dev = "cuda" if torch.cuda.is_available() else "cpu"
         print(f"\n  [{name}] {device_label(name, dev)}")
 
         X_train_t = torch.tensor(X_train_s, dtype=torch.float32).to(dev)
         X_test_t  = torch.tensor(X_test_s,  dtype=torch.float32).to(dev)
-        y_train_t = torch.tensor(y_train,   dtype=torch.float32).unsqueeze(1).to(dev)
-        y_test_t  = torch.tensor(y_test,    dtype=torch.float32).unsqueeze(1)
+        y_train_t = torch.tensor(y_train_s, dtype=torch.float32).unsqueeze(1).to(dev)
+        y_test_t  = torch.tensor(y_test,    dtype=torch.float32).unsqueeze(1)  # raw °C for MAE
 
         net       = MLP(n_features=X_train_t.shape[1]).to(dev)
         criterion = torch.nn.MSELoss()
-        optimizer = torch.optim.Adam(net.parameters(), lr=0.001)
+        optimizer = torch.optim.Adam(net.parameters(), lr=3e-3, weight_decay=1e-4)
+        # Reduce LR by 0.5 if loss doesn't improve for 20 epochs
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer, mode="min", factor=0.5, patience=20, verbose=False
+        )
 
+        TORCH_EPOCHS = 300
         net.train()
-        for epoch in range(100):
+        for epoch in range(TORCH_EPOCHS):
             optimizer.zero_grad()
             loss = criterion(net(X_train_t), y_train_t)
             loss.backward()
             optimizer.step()
-            if epoch % 20 == 0:
-                print(f"    Epoch {epoch:>3}  loss: {loss.item():.4f}")
+            scheduler.step(loss)
+            if epoch % 50 == 0:
+                lr_now = optimizer.param_groups[0]["lr"]
+                print(f"    Epoch {epoch:>3}/{TORCH_EPOCHS}  loss: {loss.item():.4f}  lr: {lr_now:.2e}")
 
+        # Evaluate — convert scaled predictions back to °C
         net.eval()
         with torch.no_grad():
-            mae = torch.mean(torch.abs(net(X_test_t).cpu() - y_test_t)).item()
+            pred_scaled = net(X_test_t).cpu()
+            pred_celsius = pred_scaled * y_std + y_mean   # un-scale
+            mae = torch.mean(torch.abs(pred_celsius - y_test_t)).item()
         print(f"    MAE: {mae:.4f}°C")
 
-        # Wrap with scaler so predict(X) works identically to sklearn models
-        wrapper = TorchRegressorWrapper(model=net.cpu(), scaler=scaler)
+        # Wrapper stores X_scaler + y stats so predict() returns °C correctly
+        wrapper = TorchRegressorWrapper(
+            model=net.cpu(), scaler=X_scaler,
+            y_mean=y_mean, y_std=y_std
+        )
         return wrapper, mae
 
     except Exception as e:
