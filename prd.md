@@ -1164,3 +1164,122 @@ If the two predictions differ (they will, because lag features updated), the mod
 | Bias tracking per season | Low — diagnostic improvement | Low | Later |
 | Sample weighting for recent data | Medium — better seasonal accuracy | Medium | Later |
 | `.pkl` files in Git | Low — repo size issue over time | Low | Later |
+
+
+---
+
+## 16. Model Validation Results — Colab Analysis (March 2026)
+
+Full analysis run in Google Colab on 2020–2026 data (6 years, ~52,000 hourly rows).
+
+---
+
+### Verdict
+
+```
+Best model  : RandomForest
+MAE         : 0.1564°C
+RMSE        : 0.2970°C
+Naive MAE   : 0.9485°C
+Improvement : 83.5% over naive baseline
+
+✅ Model is genuinely learning — significantly better than naive baseline.
+```
+
+The naive baseline ("predict same temperature as last hour") has MAE of 0.9485°C. RandomForest achieves 0.1564°C — an 83.5% reduction in error. The model is not just memorising lag values; it is learning the shape of temperature change.
+
+---
+
+### Feature Correlation with Temperature
+
+| Feature | Correlation | Interpretation |
+|---|---|---|
+| `temp_lag_1h` | 0.987 | Strongest signal — temperature changes slowly hour to hour |
+| `temp_lag_24h` | 0.977 | Same hour yesterday — captures daily cycle |
+| `feels_like` | 0.967 | Near-identical to temperature by definition |
+| `temp_rolling_mean_6h` | 0.947 | Smoothed recent trend |
+| `temp_lag_3h` | 0.913 | Short-term direction |
+| `daily_temp_max` | 0.854 | Daily range context |
+| `daily_temp_min` | 0.849 | Daily range context |
+| `pressure` | 0.792 | High pressure = clear sky = hot days in Gurgaon |
+| `humidity` | 0.592 | Inverse in summer (monsoon cools), positive in winter |
+| `dew_point` | 0.505 | Correlated with humidity |
+| `season` | 0.469 | Seasonal variation captured |
+| `wind_gusts` | 0.443 | Moderate signal |
+| `is_daytime` | 0.308 | Day/night split |
+| `wind_speed` | 0.232 | Weak linear signal |
+| `rain` / `precipitation` | 0.023 | Near-zero linear correlation — non-linear effect only |
+| `day_of_week` | 0.003 | No physical relationship — candidate for removal |
+
+The low correlation of `rain` and `precipitation` does not mean they are useless — a sudden thunderstorm can drop temperature 5°C in an hour, which is a non-linear interaction that tree models can capture via splits. Linear correlation misses this.
+
+`day_of_week` at 0.003 has no physical or statistical justification. It can be removed from `FEATURE_COLS` without any accuracy loss.
+
+---
+
+### Feature Importance (RandomForest)
+
+The model's internal feature importance tells a different story from raw correlation:
+
+| Rank | Feature | Importance |
+|---|---|---|
+| 1 | `feels_like` | ~0.80 |
+| 2 | `temp_lag_1h` | ~0.16 |
+| 3–5 | `hour`, `humidity_pressure_ratio`, `daily_temp_max` | ~0.01 each |
+| 6–24 | All remaining features | < 0.01 each |
+
+`feels_like` dominates at ~80% importance. This is a data leakage concern — `feels_like` (apparent temperature) is computed from temperature, humidity, and wind. It is essentially a transformation of the target variable. The model is partly predicting temperature from a derived version of temperature.
+
+This does not invalidate the model for next-hour prediction — `feels_like` at hour T is a real observable input when predicting hour T+1. But it means the model is heavily dependent on this one feature. If `feels_like` is ever missing or noisy, accuracy will degrade significantly.
+
+**Recommendation:** Test model accuracy with `feels_like` removed to understand true predictive power from independent features.
+
+---
+
+### Residual Analysis
+
+- Residual distribution is centred at mean = 0.037°C — essentially unbiased
+- Distribution is tight and symmetric — no systematic over/under prediction
+- Scatter plot (predicted vs actual) hugs the diagonal across the full 5°C–42°C range
+- Occasional spikes up to ±3.5°C in residuals — these correspond to sudden weather events (thunderstorms, cold fronts) that the model cannot anticipate from lag features alone
+
+---
+
+### Error by Hour of Day (UTC)
+
+The model is most accurate at night (UTC 0–6, which is IST 5:30–11:30) and least accurate during the afternoon transition (UTC 13, which is IST 18:30 — peak evening cooling):
+
+| Period | UTC hours | MAE |
+|---|---|---|
+| Night (best) | 4–6 UTC | ~0.05–0.07°C |
+| Afternoon transition (worst) | 13 UTC | ~0.33°C |
+| Evening | 18–23 UTC | ~0.15–0.17°C |
+
+The afternoon peak error aligns with the steepest part of the daily temperature curve — the model slightly lags behind rapid cooling after peak heat.
+
+---
+
+### Error by Month
+
+| Month | MAE | Note |
+|---|---|---|
+| Jan, Feb | ~0.10°C | Stable winter — easiest to predict |
+| Nov, Dec | ~0.10°C | Stable cool season |
+| Mar | ~0.17°C | Spring transition begins |
+| Apr | ~0.24°C | Rapid warming |
+| May | ~0.28°C | Highest error — peak heat + most volatile |
+| Jun | ~0.21°C | Monsoon onset — sudden drops |
+| Jul, Aug | ~0.15°C | Monsoon stabilises temperature |
+| Sep, Oct | ~0.15–0.20°C | Post-monsoon transition |
+
+May is the hardest month — temperatures can swing 10°C in a day during pre-monsoon storms. The model's lag-based approach struggles most when temperature changes are sudden and large.
+
+---
+
+### What This Means for Production
+
+1. The model is production-ready for next-hour predictions — 0.1564°C MAE is well within acceptable range for a weather display application.
+2. Multi-hour forecasts degrade as the autoregressive chain propagates small errors forward — hours 4–6 should be treated as indicative, not precise.
+3. May–June predictions carry higher uncertainty (~0.25–0.28°C MAE) — consider surfacing this to users.
+4. The `feels_like` dominance is worth investigating — removing it and retraining would reveal the model's true independent predictive power.
+5. `day_of_week` should be removed from features — zero correlation, zero importance, adds noise.
