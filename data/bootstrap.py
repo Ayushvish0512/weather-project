@@ -5,6 +5,7 @@ Already downloaded files are skipped automatically.
 Change HISTORY_END to extend the range.
 """
 import os
+import time
 import requests
 import pandas as pd
 from datetime import date, timedelta
@@ -59,8 +60,17 @@ def download_year(start: date, end: date) -> str:
 
     url = f"{BASE_URL}&start_date={start}&end_date={end}"
     print(f"Downloading {start} → {end} ...", end=" ", flush=True)
-    resp = requests.get(url, timeout=60)
-    resp.raise_for_status()
+    for attempt in range(5):
+        resp = requests.get(url, timeout=60)
+        if resp.status_code == 429:
+            wait = 60 * (attempt + 1)
+            print(f"\n  Rate limited (429). Waiting {wait}s before retry {attempt + 1}/5...")
+            time.sleep(wait)
+            continue
+        resp.raise_for_status()
+        break
+    else:
+        raise RuntimeError(f"Failed to download {start} → {end} after 5 attempts (rate limited).")
 
     df = pd.DataFrame(resp.json()["hourly"])
     df = df[list(COLUMN_MAP.keys())].rename(columns=COLUMN_MAP)
@@ -81,6 +91,7 @@ def sync():
         chunk_end = min(chunk_start + relativedelta(years=1) - timedelta(days=1), HISTORY_END)
         download_year(chunk_start, chunk_end)
         chunk_start = chunk_end + timedelta(days=1)
+        time.sleep(2)   # be polite to the API between chunks
     print("Bootstrap complete.")
 
 

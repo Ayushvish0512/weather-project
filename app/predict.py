@@ -67,12 +67,19 @@ def _fetch_live_data() -> pd.DataFrame:
     return df.tail(30).reset_index(drop=True)
 
 
-def get_latest_features() -> tuple[np.ndarray, dict]:
+def weather_summary(temp: float, cloudcover: float, wind_speed: float) -> str:
+    label = "Very Hot" if temp >= 35 else "Hot" if temp >= 28 else "Warm" if temp >= 20 else "Cool" if temp >= 10 else "Cold"
+    label += ", Overcast" if cloudcover > 75 else ", Partly Cloudy" if cloudcover > 40 else ", Clear"
+    if wind_speed > 40:   label += ", Strong Winds"
+    elif wind_speed > 20: label += ", Breezy"
+    return label
+
+
+def _get_base_df() -> tuple[pd.DataFrame, dict]:
     """
-    Load last 30 rows and engineer all 24 features.
-    Source priority:
-      1. Local CSV files (local dev / if CSVs committed)
-      2. Live Open-Meteo API fetch (Render — no CSVs)
+    Load last 30 rows as a DataFrame (with engineered features) so we can
+    roll the lag/rolling columns forward for multi-step forecasting.
+    Returns (df_with_features, raw_dict).
     """
     files = sorted(glob.glob(DATA_GLOB))
 
@@ -81,7 +88,6 @@ def get_latest_features() -> tuple[np.ndarray, dict]:
         df["recorded_at"] = pd.to_datetime(df["recorded_at"])
         df = df.sort_values("recorded_at").reset_index(drop=True)
     else:
-        # No CSVs — fetch live from Open-Meteo (Render environment)
         try:
             df = _fetch_live_data()
         except Exception as e:
@@ -97,15 +103,38 @@ def get_latest_features() -> tuple[np.ndarray, dict]:
         "cloudcover": float(last.get("cloudcover", 0)),
         "wind_speed":  float(last.get("wind_speed", 0)),
     }
-    return last[FEATURE_COLS].values.astype("float32").reshape(1, -1), raw
+    return df, raw
 
 
-def weather_summary(temp: float, cloudcover: float, wind_speed: float) -> str:
-    label = "Very Hot" if temp >= 35 else "Hot" if temp >= 28 else "Warm" if temp >= 20 else "Cool" if temp >= 10 else "Cold"
-    label += ", Overcast" if cloudcover > 75 else ", Partly Cloudy" if cloudcover > 40 else ", Clear"
-    if wind_speed > 40:   label += ", Strong Winds"
-    elif wind_speed > 20: label += ", Breezy"
-    return label
+def _roll_features(df: pd.DataFrame, predicted_temp: float, next_dt: datetime) -> pd.DataFrame:
+    """
+    Append a synthetic row using the predicted temperature so that the next
+    step's lag and rolling features reflect the forecast, not stale history.
+    """
+    last = df.iloc[-1].copy()
+    last["recorded_at"]  = pd.Timestamp(next_dt)
+    last["temperature"]  = predicted_temp
+
+    # Append and recompute only the lag/rolling columns that change
+    df = pd.concat([df, last.to_frame().T], ignore_index=True)
+    df["recorded_at"] = pd.to_datetime(df["recorded_at"])
+
+    df["temp_lag_1h"]  = df["temperature"].shift(1)
+    df["temp_lag_3h"]  = df["temperature"].shift(3)
+    df["temp_lag_24h"] = df["temperature"].shift(24)
+    df["temp_rolling_mean_6h"] = df["temperature"].rolling(6, min_periods=1).mean()
+    df["temp_rolling_std_6h"]  = df["temperature"].rolling(6, min_periods=1).std().fillna(0)
+
+    # Update time features for the new row
+    idx = df.index[-1]
+    dt  = df.at[idx, "recorded_at"]
+    df.at[idx, "hour"]       = dt.hour
+    df.at[idx, "day_of_week"]= dt.dayofweek
+    df.at[idx, "month"]      = dt.month
+    df.at[idx, "season"]     = dt.month % 12 // 3
+    df.at[idx, "is_daytime"] = int(6 <= dt.hour <= 18)
+
+    return df
 
 
 # ── Endpoints ──────────────────────────────────────────────
@@ -117,7 +146,8 @@ def predict_next_hour():
     if model is None:
         raise HTTPException(status_code=503, detail="Model not trained. Run ml/train.py first.")
 
-    features, raw = get_latest_features()
+    df, raw = _get_base_df()
+    features = df[FEATURE_COLS].iloc[-1].values.astype("float32").reshape(1, -1)
     dt   = datetime.utcnow().replace(minute=0, second=0, microsecond=0) + timedelta(hours=1)
     temp = round(float(model.predict(features)[0]), 2)
     insert_prediction(dt, temp, MODEL_VERSION)
@@ -140,13 +170,14 @@ def predict_multiple_hours(hours: int = 6):
     if model is None:
         raise HTTPException(status_code=503, detail="Model not trained. Run ml/train.py first.")
 
-    features, raw = get_latest_features()
+    df, raw = _get_base_df()
     now = datetime.utcnow().replace(minute=0, second=0, microsecond=0)
 
     forecast = []
     for h in range(1, hours + 1):
-        dt   = now + timedelta(hours=h)
-        temp = round(float(model.predict(features)[0]), 2)
+        dt       = now + timedelta(hours=h)
+        features = df[FEATURE_COLS].iloc[-1].values.astype("float32").reshape(1, -1)
+        temp     = round(float(model.predict(features)[0]), 2)
         insert_prediction(dt, temp, MODEL_VERSION)
         forecast.append({
             "hour":             h,
@@ -154,6 +185,8 @@ def predict_multiple_hours(hours: int = 6):
             "predicted_temp_c": temp,
             "summary":          weather_summary(temp, raw["cloudcover"], raw["wind_speed"]),
         })
+        # Roll the dataframe forward so the next step uses this prediction as lag input
+        df = _roll_features(df, temp, dt)
 
     return {
         "location":      "Gurgaon, IN",

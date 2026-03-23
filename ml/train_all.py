@@ -91,8 +91,8 @@ ROOT       = Path(__file__).resolve().parent.parent
 MODELS_DIR = ROOT / "ml"
 
 # ── Config ───────────────────────────────────────────────────────────────────
-EPOCHS       = 20
-TREES_TOTAL  = 100
+EPOCHS       = 100
+TREES_TOTAL  = 500
 TORCH_EPOCHS = 300   # epochs for PyTorch MLP — increase for better accuracy (500–1000)
 CPU_CORES    = os.cpu_count() or 4
 
