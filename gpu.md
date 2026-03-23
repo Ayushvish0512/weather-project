@@ -263,3 +263,156 @@ pip install xgboost==2.0.3
 - `FORCE_GPU = True` causes hard stop if GPU unavailable
 - Each model prints which device it is using
 - `nvidia-smi -l 1` shows GPU memory usage during XGBoost training
+
+
+---
+
+## Colab GPU Acceleration — cuML Reference
+
+These are Colab's recommended snippets for accelerating sklearn with GPU via `cuml.accel`. Requires a Colab GPU runtime (T4 or better). The magic `%load_ext cuml.accel` must come before any sklearn imports — it patches sklearn to route supported operations to RAPIDS cuML on the GPU transparently.
+
+> Note: `cuml.accel` is only available in Colab GPU environments and RAPIDS installations. It does not work on local CPU-only machines or Render.
+
+---
+
+### K-Means Segmentation
+
+```python
+%load_ext cuml.accel
+from sklearn.cluster import KMeans
+from sklearn.datasets import make_blobs
+from sklearn.metrics import silhouette_score
+
+n_samples = 1000
+n_features = 2
+n_clusters = 3
+
+X, _ = make_blobs(n_samples=n_samples, n_features=n_features, centers=n_clusters, random_state=42)
+kmeans = KMeans(n_clusters=n_clusters, max_iter=100)
+kmeans.fit(X)
+labels = kmeans.labels_
+print(silhouette_score(X, labels))
+```
+
+---
+
+### K-Nearest Neighbors Classifier
+
+```python
+%load_ext cuml.accel
+from sklearn.datasets import make_classification
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import classification_report
+from sklearn.neighbors import KNeighborsClassifier
+
+X, y = make_classification(n_samples=100000, n_features=100, random_state=0)
+X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2)
+knn = KNeighborsClassifier(n_neighbors=5)
+knn.fit(X_train, y_train)
+y_pred = knn.predict(X_test)
+print(classification_report(y_test, y_pred))
+```
+
+> Relevant to this project: KNN is one of the 7 trained models. On CPU it's the slowest at inference time (scans all training rows). GPU acceleration via cuML would make it viable for larger datasets.
+
+---
+
+### Logistic Regression Classifier
+
+```python
+%load_ext cuml.accel
+from sklearn.datasets import make_classification
+from sklearn.model_selection import train_test_split
+from sklearn.linear_model import LogisticRegression
+
+X, y = make_classification(n_samples=1000000, n_features=200, random_state=0)
+X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2)
+clf = LogisticRegression()
+clf.fit(X_train, y_train)
+y_pred = clf.predict(X_test)
+print(classification_report(y_test, y_pred))
+```
+
+---
+
+### PCA Dimensionality Reduction
+
+```python
+%load_ext cuml.accel
+import numpy as np
+from sklearn.decomposition import PCA
+
+X = np.array([[-1, -1], [-2, -1], [-3, -2], [1, 1], [2, 1], [3, 2]])
+pca = PCA(n_components=2)
+pca.fit(X)
+print(pca.explained_variance_ratio_)
+print(pca.singular_values_)
+```
+
+> Potential use in this project: PCA could reduce the 24 feature dimensions before training, removing correlated features like `feels_like` + `temp_lag_1h` that carry redundant information.
+
+---
+
+### Random Forest Classification
+
+```python
+%load_ext cuml.accel
+from sklearn.datasets import make_classification
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import classification_report
+from sklearn.ensemble import RandomForestClassifier
+
+X, y = make_classification(n_samples=100000, n_features=100, random_state=0)
+X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2)
+clf = RandomForestClassifier(n_estimators=100, max_depth=5, max_features=1.0, n_jobs=-1)
+clf.fit(X_train, y_train)
+y_pred = clf.predict(X_test)
+print(classification_report(y_test, y_pred))
+```
+
+> Directly applicable: this project's best model is RandomForest. Adding `%load_ext cuml.accel` in Colab before training would accelerate it on GPU without any code changes.
+
+---
+
+### UMAP Dimensionality Reduction
+
+```python
+%load_ext cuml.accel
+import matplotlib.pyplot as plt
+from sklearn.datasets import make_classification
+from sklearn.model_selection import train_test_split
+import umap
+
+X, y = make_classification(n_samples=100000, n_features=20, n_classes=5, n_informative=5, random_state=0)
+X_train, _, y_train, _ = train_test_split(X, y, test_size=0.2)
+
+umap_model = umap.UMAP(n_neighbors=15, n_components=2, random_state=42, min_dist=0.0)
+X_train_umap = umap_model.fit_transform(X_train)
+
+plt.figure(figsize=(10, 8))
+plt.scatter(X_train_umap[:, 0], X_train_umap[:, 1], c=y_train, cmap='Spectral', s=10)
+plt.colorbar(label="Activity")
+plt.title("UMAP projection")
+plt.xlabel("UMAP Component 1")
+plt.ylabel("UMAP Component 2")
+plt.show()
+```
+
+> UMAP could be used to visualise the 24-feature weather dataset in 2D — useful for spotting seasonal clusters or anomalous weather events in the training data.
+
+---
+
+### How to Use in This Project (Colab)
+
+To accelerate `weather_analysis.ipynb` training on Colab GPU:
+
+1. Set runtime to GPU: Runtime → Change runtime type → T4 GPU
+2. Add at the very top of the training cell, before any sklearn import:
+
+```python
+%load_ext cuml.accel
+```
+
+3. Run normally — cuML intercepts RandomForest, KNN, Ridge, and PCA calls and routes them to GPU. No other code changes needed.
+
+The `%load_ext cuml.accel` approach only works in Colab/RAPIDS environments. The local `ml/train_all.py` pipeline uses XGBoost `device="cuda"` and PyTorch CUDA for GPU acceleration instead — those are the correct paths for local GTX 1650 usage.
