@@ -120,7 +120,9 @@ def _roll_features(df: pd.DataFrame, predicted_temp: float, next_dt: datetime) -
     df["recorded_at"] = pd.to_datetime(df["recorded_at"])
 
     df["temp_lag_1h"]  = df["temperature"].shift(1)
+    df["temp_lag_2h"]  = df["temperature"].shift(2)
     df["temp_lag_3h"]  = df["temperature"].shift(3)
+    df["temp_lag_6h"]  = df["temperature"].shift(6)
     df["temp_lag_24h"] = df["temperature"].shift(24)
     df["temp_rolling_mean_6h"] = df["temperature"].rolling(6, min_periods=1).mean()
     df["temp_rolling_std_6h"]  = df["temperature"].rolling(6, min_periods=1).std().fillna(0)
@@ -129,6 +131,8 @@ def _roll_features(df: pd.DataFrame, predicted_temp: float, next_dt: datetime) -
     idx = df.index[-1]
     dt  = df.at[idx, "recorded_at"]
     df.at[idx, "hour"]       = dt.hour
+    df.at[idx, "hour_sin"]   = np.sin(2 * np.pi * dt.hour / 24)
+    df.at[idx, "hour_cos"]   = np.cos(2 * np.pi * dt.hour / 24)
     df.at[idx, "day_of_week"]= dt.dayofweek
     df.at[idx, "month"]      = dt.month
     df.at[idx, "season"]     = dt.month % 12 // 3

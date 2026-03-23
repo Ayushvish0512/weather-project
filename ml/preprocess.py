@@ -10,17 +10,17 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 
 FEATURE_COLS = [
-    # Time
-    "hour", "day_of_week", "month", "season", "is_daytime",
-    # Raw weather
+    # Time — cyclical encoding so model understands 23→0 wraps
+    "hour", "hour_sin", "hour_cos", "day_of_week", "month", "season", "is_daytime",
+    # Raw weather (feels_like removed — it's derived from temperature, causes leakage)
     "humidity", "dew_point", "pressure", "cloudcover",
     "wind_speed", "wind_direction", "wind_gusts",
-    "feels_like", "precipitation", "rain", "weather_main",
+    "precipitation", "rain", "weather_main",
     # Derived
     "humidity_pressure_ratio",
     "daily_temp_max", "daily_temp_min",
-    # Lag features (most powerful for time-series)
-    "temp_lag_1h", "temp_lag_3h", "temp_lag_24h",
+    # Lag features — extended for better trend signal
+    "temp_lag_1h", "temp_lag_2h", "temp_lag_3h", "temp_lag_6h", "temp_lag_24h",
     # Rolling stats
     "temp_rolling_mean_6h", "temp_rolling_std_6h",
 ]
@@ -42,9 +42,11 @@ def engineer_features(df: pd.DataFrame) -> pd.DataFrame:
 
     # Time features
     df["hour"]       = dt.dt.hour
+    df["hour_sin"]   = np.sin(2 * np.pi * dt.dt.hour / 24)   # cyclical — 23→0 wraps smoothly
+    df["hour_cos"]   = np.cos(2 * np.pi * dt.dt.hour / 24)
     df["day_of_week"]= dt.dt.dayofweek
     df["month"]      = dt.dt.month
-    df["season"]     = (dt.dt.month % 12 // 3)   # 0=winter 1=spring 2=summer 3=autumn
+    df["season"]     = (dt.dt.month % 12 // 3)
     df["is_daytime"] = dt.dt.hour.between(6, 18).astype(int)
 
     # Derived
@@ -55,9 +57,11 @@ def engineer_features(df: pd.DataFrame) -> pd.DataFrame:
     df["daily_temp_max"] = df.groupby(date_col)["temperature"].cummax()
     df["daily_temp_min"] = df.groupby(date_col)["temperature"].cummin()
 
-    # Lag features — shift within sorted time series
+    # Lag features — extended set for better trend signal
     df["temp_lag_1h"]  = df["temperature"].shift(1)
+    df["temp_lag_2h"]  = df["temperature"].shift(2)
     df["temp_lag_3h"]  = df["temperature"].shift(3)
+    df["temp_lag_6h"]  = df["temperature"].shift(6)
     df["temp_lag_24h"] = df["temperature"].shift(24)
 
     # Rolling stats (min_periods so early rows aren't all NaN)
