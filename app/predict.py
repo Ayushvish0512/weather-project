@@ -124,8 +124,11 @@ def _roll_features(df: pd.DataFrame, predicted_temp: float, next_dt: datetime) -
     df["temp_lag_3h"]  = df["temperature"].shift(3)
     df["temp_lag_6h"]  = df["temperature"].shift(6)
     df["temp_lag_24h"] = df["temperature"].shift(24)
-    df["temp_rolling_mean_6h"] = df["temperature"].rolling(6, min_periods=1).mean()
-    df["temp_rolling_std_6h"]  = df["temperature"].rolling(6, min_periods=1).std().fillna(0)
+    # shift(1) before rolling so the current row's temperature is excluded from
+    # its own window — matches the fix applied in ml/preprocess.py
+    shifted = df["temperature"].shift(1)
+    df["temp_rolling_mean_6h"] = shifted.rolling(6, min_periods=1).mean()
+    df["temp_rolling_std_6h"]  = shifted.rolling(6, min_periods=1).std().fillna(0)
 
     # Update time features for the new row
     idx = df.index[-1]
@@ -133,8 +136,9 @@ def _roll_features(df: pd.DataFrame, predicted_temp: float, next_dt: datetime) -
     df.at[idx, "hour"]       = dt.hour
     df.at[idx, "hour_sin"]   = np.sin(2 * np.pi * dt.hour / 24)
     df.at[idx, "hour_cos"]   = np.cos(2 * np.pi * dt.hour / 24)
-    df.at[idx, "day_of_week"]= dt.dayofweek
     df.at[idx, "month"]      = dt.month
+    df.at[idx, "month_sin"]  = np.sin(2 * np.pi * dt.month / 12)
+    df.at[idx, "month_cos"]  = np.cos(2 * np.pi * dt.month / 12)
     df.at[idx, "season"]     = dt.month % 12 // 3
     df.at[idx, "is_daytime"] = int(6 <= dt.hour <= 18)
 

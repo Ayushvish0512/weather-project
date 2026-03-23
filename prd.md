@@ -1168,7 +1168,136 @@ If the two predictions differ (they will, because lag features updated), the mod
 
 ---
 
-## 16. Model Validation Results — Colab Analysis (March 2026)
+## 16. Feature Engineering Fixes — March 2026
+
+Three correctness issues were identified and fixed in `ml/preprocess.py` and `app/predict.py`. These are not optional improvements — they are bugs that inflate reported accuracy and must be fixed before any model results are trusted.
+
+---
+
+### Fix 1 — Rolling features were leaking the target
+
+**Problem:**
+
+```python
+# BEFORE (leaky)
+df["temp_rolling_mean_6h"] = df["temperature"].rolling(6, min_periods=1).mean()
+df["temp_rolling_std_6h"]  = df["temperature"].rolling(6, min_periods=1).std()
+```
+
+`rolling(6)` on the raw `temperature` column includes the current row in its own window. At row `t`, the 6-hour mean includes `temperature[t]` — which is the target variable `y`. The model was being trained with the answer partially visible in the input.
+
+**Fix:**
+
+```python
+# AFTER (correct)
+shifted = df["temperature"].shift(1)
+df["temp_rolling_mean_6h"] = shifted.rolling(6, min_periods=1).mean()
+df["temp_rolling_std_6h"]  = shifted.rolling(6, min_periods=1).std().fillna(0)
+```
+
+`shift(1)` moves the series back by one row before the rolling window is applied. The window at row `t` now covers `[t-6 ... t-1]` — all past values, none of the current target. This fix is applied in both `ml/preprocess.py` (training) and `app/predict.py` (`_roll_features`, multi-step forecasting).
+
+---
+
+### Fix 2 — `daily_temp_max` / `daily_temp_min` were leaking the target
+
+**Problem:**
+
+```python
+# BEFORE (leaky)
+df["daily_temp_max"] = df.groupby(date_col)["temperature"].cummax()
+df["daily_temp_min"] = df.groupby(date_col)["temperature"].cummin()
+```
+
+`cummax()` / `cummin()` within a calendar day is an expanding window that includes the current row. At hour 14, `daily_temp_max` is the maximum of hours 0–14 inclusive — which includes `temperature[t]`, the target. This is direct target leakage.
+
+**Fix:** Both features removed from `FEATURE_COLS` entirely.
+
+The Colab analysis (Section 17) showed these features had correlation 0.854 and 0.849 with temperature — high enough to be useful, but the leakage means that correlation was partly artificial. If daily range context is needed in a future version, the correct implementation is to use the previous day's max/min:
+
+```python
+# Correct (no leakage) — uses yesterday's values only
+daily_stats = df.groupby(df["recorded_at"].dt.date)["temperature"].agg(["max", "min"])
+daily_stats.index = pd.to_datetime(daily_stats.index) + timedelta(days=1)
+df = df.join(daily_stats.rename(columns={"max": "prev_day_max", "min": "prev_day_min"}),
+             on=df["recorded_at"].dt.normalize())
+```
+
+This is not yet implemented — the features are simply dropped for now.
+
+---
+
+### Fix 3 — `month` was a raw integer, breaking cyclical continuity
+
+**Problem:**
+
+`month` was encoded as a raw integer (1–12). The model sees December (12) and January (1) as 11 units apart — the largest possible gap — when they are actually adjacent months. This breaks seasonal continuity at the year boundary.
+
+**Fix:**
+
+```python
+# AFTER — cyclical encoding, same pattern as hour_sin/hour_cos
+df["month_sin"] = np.sin(2 * np.pi * dt.dt.month / 12)
+df["month_cos"] = np.cos(2 * np.pi * dt.dt.month / 12)
+```
+
+`month` (raw int) is kept in `FEATURE_COLS` for tree models that can use it directly, but `month_sin` and `month_cos` are added alongside it so the model has both representations available.
+
+---
+
+### Fix 4 — `day_of_week` removed
+
+`day_of_week` had a Pearson correlation of 0.003 with temperature and near-zero feature importance in RandomForest. There is no physical mechanism by which the day of the week affects outdoor temperature in Gurgaon. It was adding noise to the feature space. Removed from `FEATURE_COLS`.
+
+---
+
+### Fix 5 — Persistence baseline added to training output
+
+Every `ml/train_all.py` run now prints a persistence baseline alongside model MAE:
+
+```
+Model                     MAE       vs Naive
+-----------------------------------------------
+gradient_boosting      0.2036°C    +78.5%
+random_forest          0.2938°C    +69.0%
+xgboost                0.3097°C    +67.3%
+...
+
+  Persistence baseline (naive): 0.9485°C
+  (naive = predict temp(t+1) = temp(t))
+```
+
+The persistence baseline is `temp(t+1) = temp(t)` — predicting that the next hour's temperature equals the current hour's temperature. This is the simplest possible predictor. Any model that doesn't beat it significantly is not worth deploying.
+
+The baseline MAE is computed from `temp_lag_1h` in the test split (the current temperature at each test row), compared against the actual next-hour temperature `y_test`. This uses the same test rows as all model evaluations, so the comparison is fair.
+
+---
+
+### Updated Feature Set After Fixes
+
+| Feature | Status | Reason |
+|---|---|---|
+| `hour` | ✅ kept | Raw int useful for tree splits |
+| `hour_sin`, `hour_cos` | ✅ kept | Cyclical continuity |
+| `month` | ✅ kept | Raw int useful for tree splits |
+| `month_sin`, `month_cos` | ✅ added | Cyclical continuity — Dec→Jan wraps |
+| `season` | ✅ kept | Coarse seasonal bucket |
+| `is_daytime` | ✅ kept | Day/night split |
+| `day_of_week` | ❌ removed | Correlation=0.003, zero importance |
+| `feels_like` | ❌ removed (was already) | Target leakage |
+| `daily_temp_max` | ❌ removed | Target leakage via cummax |
+| `daily_temp_min` | ❌ removed | Target leakage via cummin |
+| `temp_rolling_mean_6h` | ✅ fixed | Now uses shift(1) before rolling |
+| `temp_rolling_std_6h` | ✅ fixed | Now uses shift(1) before rolling |
+| All lag features | ✅ kept | shift(≥1) — no leakage |
+| All raw weather cols | ✅ kept | Independent of target |
+| `humidity_pressure_ratio` | ✅ kept | Derived from independent cols |
+
+Total features: 28 (was 27 — net +1 from adding month_sin/month_cos, removing daily_temp_max/min and day_of_week).
+
+---
+
+## 17. Model Validation Results — Colab Analysis (March 2026)
 
 Full analysis run in Google Colab on 2020–2026 data (6 years, ~52,000 hourly rows).
 

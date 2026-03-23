@@ -377,12 +377,25 @@ def train_all(only: list[str] | None = None):
         print("\nNo models trained. Check the model names passed via CLI.")
         return
 
+    # ── Persistence baseline — temp(t+1) = temp(t) ───────────────────────────
+    # This is the naive "do nothing" predictor. Any model that doesn't beat
+    # this significantly is not worth the complexity.
+    # We use the test split only (same rows the models were evaluated on).
+    # temp_lag_1h in X_test is the current temperature — predicting that as
+    # next-hour temperature is exactly the persistence baseline.
+    lag1_col = FEATURE_COLS.index("temp_lag_1h")
+    naive_preds = X_test[:, lag1_col]
+    naive_mae   = mean_absolute_error(y_test, naive_preds)
+
     # ── Summary ──────────────────────────────────────────────────────────────
     print("\n" + "=" * 50)
-    print(f"{'Model':<25} {'MAE':>8}")
-    print("-" * 35)
+    print(f"{'Model':<25} {'MAE':>8}  {'vs Naive':>10}")
+    print("-" * 47)
     for name, mae in sorted(summary.items(), key=lambda x: x[1]):
-        print(f"{name:<25} {mae:>8.4f}°C")
+        improvement = (naive_mae - mae) / naive_mae * 100
+        print(f"{name:<25} {mae:>8.4f}°C  {improvement:>+8.1f}%")
+    print(f"\n  Persistence baseline (naive): {naive_mae:.4f}°C")
+    print(f"  (naive = predict temp(t+1) = temp(t))")
 
     best = min(summary, key=summary.get)
     best_model = joblib.load(MODELS_DIR / f"model_{best}.pkl")
